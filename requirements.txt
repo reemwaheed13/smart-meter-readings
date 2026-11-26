@@ -1,7 +1,8 @@
 # Exact pins. flwr especially: SecAgg+ APIs change between versions.
 # CPU-only torch: pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
 torch==2.15.0
-flwr==1.45.0
+flwr[simulation]==1.45.0
+ray==2.56.0                  # pulled in by flwr[simulation]; the only simulation backend
 pyyaml==6.0.4
 numpy==2.5.5
 scipy==1.18.1

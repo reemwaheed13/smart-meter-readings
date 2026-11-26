@@ -65,6 +65,15 @@ secaggplus:
   quantization_range: null       # null = Flower default
   modulus_range: null            # null = Flower default
 
+simulation:
+  # Flower simulation (flwr.simulation.run_simulation, Ray backend).
+  client_num_cpus: 2             # Ray CPUs per client actor (Flower's default)
+  client_weight: 1               # num_examples every client reports; identical for all, so no client counts more
+
+paths:                           # relative to the repository root
+  recordings: recordings         # attack recordings (gitignored; shared Drive)
+  logs: logs                     # per-round CSV logs and test error (gitignored)
+
 seeds:
   # run_seed = 1000*n + 10*k   (implemented in common.run_seed)
   # The houses depend only on (n, k). run_seed sets the model init, the per-round dates and

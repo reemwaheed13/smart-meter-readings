@@ -57,7 +57,7 @@ load forecasting in simulation (Delgado Fernández et al., 2021), but without at
    server can recover when it sees only the **total of 5, 10 or 20 houses**, as it does under SecAgg. The number of
    houses is a main experiment, not a side note.
 3. **A distributed-noise step for Flower's SecAgg+.** Flower does not offer a step where each house adds its share
-   of the DP noise before SecAgg+ masks its update. We implement it.
+   of the DP noise before SecAgg+ masks its update. We implement it as a client mod, `noise_share_mod`.
 
 ## Plan for this semester
 
@@ -65,18 +65,26 @@ Everything runs on a PC, using [Flower](https://flower.ai) to simulate many hous
 
 1. **Forecasting task.** Train a small electricity-forecasting model on a public smart-meter dataset
    (London Smartmeter).
-2. **Three protection levels:**
+2. **Three protection levels, and only these three:**
 
-   | Level | Implementation |
-   |---|---|
-   | No protection | Plain Flower FL |
-   | DP only | Flower's built-in local DP: each house adds its own full noise |
-   | DP with SecAgg | Flower's built-in SecAgg+, plus our own step where each house adds its share of the noise before masking |
+   | Level | Implementation | ε |
+   |---|---|---|
+   | 1. No protection | Plain Flower FL | none |
+   | 2. DP only | Flower local DP: each house clips its update and adds its own full noise on the client | 1, 8 |
+   | 3. DP with SecAgg | Flower's SecAgg+, plus our `noise_share_mod`, where each house adds its share of the noise before masking | 1, 8, and none (SecAgg+ alone) |
 
-3. **Attacks.** Run both attacks against each level, with neighbourhoods of 5, 10 and 20 houses. We start with the
-   learned inverter, and implement TS-Inverse from the paper if no public code is available.
-4. **Measurements.** For each level, neighbourhood size and ε: how well the attacker reconstructs load curves, and
-   how much forecast accuracy is lost.
+3. **Attacks.** Run both attacks, TS-Inverse and the learned inverter, at every level, with neighbourhoods of 5, 10
+   and 20 houses. We start with the learned inverter, and implement TS-Inverse from the paper if no public code is
+   available.
+4. **Measurements.** For each level, neighbourhood size and ε:
+   - **Attack success, compared with blind guessing:** sMAPE of the reconstructed load curves; how well the
+     attacker recovers routine timing; home/away detection; and, at level 3, how much each single house is
+     exposed when the server sees only the neighbourhood total.
+   - **Forecast error** in kWh.
+   - **Running cost:** time per round and bytes sent per house.
+
+Out of scope this semester: anything beyond a PC running Flower. The microcontroller and dropouts are future work
+(see below).
 
 ## Repository layout
 
@@ -86,10 +94,11 @@ common.py          shared model, local update, protection, seeds (used by client
 data.py            data interface (currently a FAKE random stub, to be replaced by the real loader)
 requirements.txt   exact pinned versions (flwr pinned: SecAgg+ APIs change between versions)
 data/              raw dataset files (gitignored, download locally)
-train/             Flower clients, server, strategies
-attacks/           learned inverter, TS-Inverse
+train/             Flower FedSGD: client, strategy, server/client apps, recorder, entry point (train.run)
+attacks/           learned inverter, TS-Inverse; recording.py loads and checks a recording
 eval/              metrics and plots
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
+logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
 ```
 
@@ -97,10 +106,79 @@ tests/             pytest tests
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu   # CPU build (optional)
+pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu   # CPU build of torch
 pip install -r requirements.txt
 pytest
 ```
+
+Install the CPU build of torch first, as shown, and then the requirements. requirements.txt installs
+`flwr[simulation]`, which brings in Ray: Ray is the only simulation backend in flwr 1.45.0. pytest runs real Flower
+simulations, so it takes about two minutes.
+
+## Running
+
+```bash
+python -m train.run --level 1 --eps none --n 5 --k 0 --lr 0.1 --T 10
+```
+
+`--lr` and `--T` are accepted only while `calibration.lr` / `calibration.T[n]` are null in config.yaml. Once
+calibration fills them in, the run takes them from config.yaml and refuses the flags. If a needed value is null
+and no flag is given, the run refuses to start. Each run writes:
+
+- `logs/L{level}_eps{eps}_n{n}_nb{k}.csv`, one row per round with `round, val_mse, round_time_s, bytes_per_house`.
+  `val_mse` is the global model's MSE on the neighbourhood's val windows after the round. `round_time_s` is the wall
+  time of Flower's fit step for the round (send, local updates, receive, aggregate). Round 1 also includes Ray
+  starting the client actors, about 20–40 s. `bytes_per_house` is the measured serialised size of the message
+  content each house sends in the round, averaged over houses.
+- `logs/L{level}_eps{eps}_n{n}_nb{k}_test.json` with the test MAE and RMSE in kWh after round T.
+- Recordings at rounds 1, ⌈T/2⌉ and T. The middle round is `(T+1)//2`, and duplicates are dropped, so T = 2
+  writes rounds 1 and 2 only.
+
+## Flower wiring (flwr 1.45.0)
+
+All three levels share one server/client API path. Level 1 is that path with nothing added. This is the path that
+`SecAggPlusWorkflow` and `secaggplus_mod` require (read from the installed source):
+
+- `SecAggPlusWorkflow.__call__` refuses any context that is not a `LegacyContext`. It drives the
+  `LegacyContext`'s legacy `Strategy`: `configure_fit` in its setup stage, and `aggregate_fit` after unmasking.
+- `secaggplus_mod` reads the client's reply with `compat.recorddict_to_fitres`, i.e. the legacy FitRes layout
+  that a `NumPyClient` produces.
+
+**Simulation:** `flwr.simulation.run_simulation(server_app, client_app, num_supernodes=n)` on the Ray backend
+(`train/run.py`). It is the only Python API for Flower's simulation runtime in 1.45.0. It prints a deprecation
+notice in favour of the `flwr run` CLI, which runs the same `ServerApp`/`ClientApp` objects.
+
+**Server** (`train/app.py`, `train/fedsgd.py`):
+`ServerApp` with `@app.main()` → `LegacyContext(strategy=FedSGD, config=ServerConfig(num_rounds=T))` →
+`DefaultWorkflow(fit_workflow=RoundRunner(inner))`, run on a `MeteredGrid` that wraps the `Grid`.
+
+- `FedSGD` is a legacy `flwr.server.strategy.Strategy`. `configure_fit` samples all n clients and puts the 4
+  dates in the fit config. `aggregate_fit` takes the mean of the updates and applies `w -= lr * mean`.
+- `RoundRunner` times the inner fit workflow, then logs val MSE and writes the recordings.
+- `MeteredGrid.send_and_receive` adds up the protobuf size of every reply's content per node.
+- Level 1: `inner = flwr.server.workflow.default_workflows.default_fit_workflow`.
+
+**Client** (`train/client.py`): `ClientApp(client_fn=..., mods=[])`. `client_fn` maps
+`node_config["partition-id"]` i to `house_ids[i]` and returns a `NumPyClient`. Its `fit` returns
+`([update [P]], weight, {"house_id": ...})`, after `common.protect(update, level, C, sigma, n)`. Every house
+reports the same weight (`simulation.client_weight`).
+
+**Where level 2 hooks in:** in the client's `common.protect` call. At level 1 it returns the update unchanged.
+At level 2 it clips to C and adds N(0, σ²) from a run_seed generator, as the handshake says. Flower's
+`LocalDpMod` cannot be used as-is. It clips the *difference* between the parameters the client returns and the
+parameters it received, which assumes the client returns weights. Our client returns a gradient. Its noise also
+comes from numpy's global RNG, not from run_seed.
+
+**Where level 3 hooks in**, with no restructuring:
+- Server: `inner = SecAggPlusWorkflow(num_shares, reconstruction_threshold, clipping_range, ...)` from
+  config.yaml `secaggplus`.
+- Client: `mods=[secaggplus_mod, noise_share_mod]`. The first mod is the outermost, so `noise_share_mod` sees
+  the plaintext update before `secaggplus_mod` quantises and masks it. Clip and noise share must be applied
+  exactly once.
+- `FedSGD.aggregate_fit` then gets results whose parameters all hold the same unmasked vector. Flower divides
+  it by the total weight, so with equal weights it is the **mean** of the n updates, not their sum. That vector
+  becomes the `[P]` `server_view`.
+- `MeteredGrid` already counts the bytes of all four SecAgg+ stages.
 
 ## Handshakes
 
@@ -156,6 +234,11 @@ recordings/L{level}_eps{eps}_n{n}_nb{k}_r{round}.pt
 | `lr`, `C`, `sigma` | |
 | `round_time_s` | |
 | `bytes_per_house` | |
+
+`view_is_sum` only matters at level 3, where `server_view` is the single `[P]` aggregate instead of one row per
+house. It is always False at levels 1–2. At level 1, `C` and `sigma` are None (no clipping, no noise).
+`attacks/recording.py: load_recording(path)` checks every key and shape. It loads with `weights_only=True`, so a
+file from the shared Drive cannot run code.
 
 ### data.py interface
 
