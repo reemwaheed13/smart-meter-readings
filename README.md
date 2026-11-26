@@ -2,6 +2,9 @@
 
 **Differential privacy and secure aggregation for smart-meter load forecasting, tested against time-series gradient inversion**
 
+*In one line:* we measure how much household load data an honest-but-curious Flower server can reconstruct from
+federated updates under no protection, local DP, and distributed DP with SecAgg+, in neighbourhoods of 5 to 20 houses.
+
 CS 5803 Applied Cryptography · LUMS · Fall 2026
 Team: Reem, Shifa-e-Fatima · Supervisor: Dr. Ali
 
@@ -74,6 +77,100 @@ Everything runs on a PC, using [Flower](https://flower.ai) to simulate many hous
    learned inverter, and implement TS-Inverse from the paper if no public code is available.
 4. **Measurements.** For each level, neighbourhood size and ε: how well the attacker reconstructs load curves, and
    how much forecast accuracy is lost.
+
+## Repository layout
+
+```
+config.yaml        every setting (single source of truth; nothing hard-coded elsewhere)
+common.py          shared model, local update, protection, seeds (used by clients AND attacks)
+data.py            data interface (currently a FAKE random stub, to be replaced by the real loader)
+requirements.txt   exact pinned versions (flwr pinned: SecAgg+ APIs change between versions)
+data/              raw dataset files (gitignored, download locally)
+train/             Flower clients, server, strategies
+attacks/           learned inverter, TS-Inverse
+eval/              metrics and plots
+recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
+tests/             pytest tests
+```
+
+## Install and test
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu   # CPU build (optional)
+pip install -r requirements.txt
+pytest
+```
+
+## Handshakes
+
+These are the agreements both halves of the project code against. Change them only by agreement, and update this
+section when you do.
+
+### common.py
+
+- `load_config(path="config.yaml")`
+- `Model`: Linear(48,64) -> sigmoid -> Linear(64,64) -> sigmoid -> Linear(64,48). MSE loss.
+- `num_params(model)` -> P (P = 10416)
+- `local_update(model, windows, lr)`: windows is a float tensor [4, 96] scaled 0–1. Inputs are the first 48
+  readings, targets the last 48. One FedSGD step: compute the mean MSE gradient over the 4 windows and return
+  it as a flat tensor [P]. Do NOT modify the model in place. The update is defined as the gradient; the server
+  applies model -= lr * aggregate. (TS-Inverse matches gradients.)
+- `protect(update, level, C, sigma, n, *, generator=None)`:
+  - level 1: return unchanged
+  - level 2: clip to L2 norm C, add N(0, sigma^2) per coordinate
+  - level 3: clip to L2 norm C, add N(0, (sigma/sqrt(n))^2) per coordinate (the noise share)
+  - sigma None or 0 means no noise (level 3, eps = none)
+
+  The generator comes from run_seed so the noise is reproducible.
+- `sigma_for(eps, C, delta)` = C * sqrt(2*ln(1.25/delta)) / eps; returns 0 when eps is None.
+  Caveat: the classic Gaussian bound is only proven for eps < 1, so eps = 8 is a per-round label
+  and the zCDP accountant's total is the reported guarantee.
+- `run_seed(n, k)` = 1000*n + 10*k, plus `set_seeds(seed)` for torch, numpy and random.
+- `flatten` / `unflatten` helpers between state_dict and [P].
+
+### config.yaml
+
+config.yaml is the single source of settings. Nothing is hard-coded elsewhere. Values that calibration
+produces (lr, T per n, C, clipping_range, sigma per eps) stay null until calibration fills them in.
+
+### Recording format
+
+One `torch.save` dict per run per attacked round at
+
+```
+recordings/L{level}_eps{eps}_n{n}_nb{k}_r{round}.pt
+```
+
+(`eps0` for level 1 and level-3 no-noise), with keys:
+
+| Key | Content |
+|---|---|
+| `level`, `eps`, `n`, `nb`, `round` | run identifiers |
+| `server_view` | `[n, P]` for levels 1–2; `[P]` for level 3, as returned by Flower's aggregate step, de-quantised |
+| `view_is_sum` | bool |
+| `global_model` | state_dict at the start of that round |
+| `true_windows` | `[n, 4, 96]` |
+| `house_ids` | list of n, same order |
+| `dates` | 4 `"YYYY-MM-DD"` |
+| `lr`, `C`, `sigma` | |
+| `round_time_s` | |
+| `bytes_per_house` | |
+
+### data.py interface
+
+- `get_neighbourhood(n, k)` -> n house IDs (deterministic in n, k)
+- `valid_dates(house_ids, split)` -> list of `"YYYY-MM-DD"`
+- `get_windows(house_ids, dates, split)` -> tensor `[houses, dates, 96]` in 0–1
+- `attacker_houses()` -> 500 IDs
+- `unscale(x)`
+
+The current data.py is a FAKE stub with random data, to be replaced by the real data.py.
+
+### Seed convention
+
+Houses depend only on (n, k). run_seed sets the model init, per-round dates and noise. The same run_seed is used
+at every level.
 
 ## Future work
 

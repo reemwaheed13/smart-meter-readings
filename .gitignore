@@ -6,7 +6,8 @@ venv/
 .ipynb_checkpoints/
 
 # Datasets and outputs (download data locally; do not commit it)
-data/
+data/*
+!data/.gitkeep
 *.csv
 *.zip
 outputs/
@@ -14,3 +15,9 @@ outputs/
 
 # Papers
 *.pdf
+
+# Attack recordings go to the shared Drive, never git
+recordings/*
+!recordings/.gitkeep
+
+.pytest_cache/

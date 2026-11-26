@@ -1,0 +1,72 @@
+# Single source of settings for the project. Nothing is hard-coded elsewhere:
+# every script reads this file through common.load_config().
+
+data:
+  dataset: "London Smartmeter (Low Carbon London), half-hourly, 2013"
+  year: 2013
+  tariff: Std                    # standard tariff only (ToU houses are excluded)
+  readings_per_day: 48           # half-hourly
+  max_missing_fraction: 0.05     # drop houses missing more than 5% of the year
+  max_fill_gap_readings: 4       # linear-fill gaps of at most 2 h (4 readings)
+  drop_windows_with_gaps: true   # windows that still have gaps after filling are dropped
+  window_length: 96
+  input_length: 48
+  output_length: 48
+  window_stride_days: 1          # one new window per day
+  split:                         # split by the window's target date
+    train: 0.64
+    val: 0.16
+    test: 0.20
+  drop_boundary_windows: true    # drop windows whose readings cross a split boundary
+  attacker_pool_size: 500        # houses held by the attacker, disjoint from the neighbourhoods
+  scaling:
+    method: minmax               # scale to 0-1
+    fit_on: attacker_pool        # min/max are fitted on the attacker pool only
+
+experiment:
+  levels: [1, 2, 3]              # 1 = no protection, 2 = local DP, 3 = distributed DP + SecAgg+
+  eps:
+    level2: [1, 8]
+    level3: [1, 8, null]         # null = SecAgg+ with no noise
+  n: [5, 10, 20]                 # houses per neighbourhood
+  neighbourhoods_k: [0, 1, 2]    # neighbourhood index for each n
+  attacked_rounds: ["1", "T/2", "T"]
+  windows_per_round: 4           # windows per house per round (one local FedSGD step)
+  clients_per_round: all         # every house takes part in every round
+
+# Left null until the calibration run fills them in. Do not hand-edit them before then.
+calibration:
+  lr: null
+  T:                             # number of rounds, per neighbourhood size n
+    5: null
+    10: null
+    20: null
+  C: null                        # L2 clipping norm for levels 2 and 3
+  clipping_range: null           # SecAgg+ clipping range
+
+dp:
+  delta: 1.0e-5
+  # Per-round Gaussian noise std for each eps. Left null until C is known, then computed with
+  # common.sigma_for(eps, C, delta). eps = null (level 3, no noise) always means sigma = 0.
+  sigma:
+    1: null
+    8: null
+
+secaggplus:
+  num_shares: 4
+  reconstruction_threshold: 3
+  clipping_range: null           # taken from calibration.clipping_range
+  # Quantisation and modulus are left at the Flower defaults (flwr==1.45.0,
+  # flwr.server.workflow.SecAggPlusWorkflow):
+  #   quantization_range = 4194304      (2**22)
+  #   modulus_range      = 4294967296   (2**32)
+  #   max_weight         = 1000.0
+  #   clipping_range     = 8.0          (overridden by the calibrated value above)
+  quantization_range: null       # null = Flower default
+  modulus_range: null            # null = Flower default
+
+seeds:
+  # run_seed = 1000*n + 10*k   (implemented in common.run_seed)
+  # The houses depend only on (n, k). run_seed sets the model init, the per-round dates and
+  # the DP noise. The same run_seed is used at every level.
+  run_seed_formula: "1000*n + 10*k"
