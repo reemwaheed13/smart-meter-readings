@@ -1,9 +1,9 @@
 """Flower ServerApp / ClientApp for all three levels (see README, "Flower wiring").
 
 Server: ServerApp(main) -> LegacyContext(strategy=FedSGD) -> DefaultWorkflow(fit_workflow=RoundRunner(inner)).
-        Level 1 uses inner = flwr's default_fit_workflow. Level 3 swaps in SecAggPlusWorkflow.
-Client: ClientApp(client_fn -> NumPyClient, mods=[...]). Level 1 has no mods. Level 3 adds
-        secaggplus_mod (and our noise_share_mod inside it).
+        Levels 1-2 use inner = flwr's default_fit_workflow. Level 3 uses SecAggPlusWorkflow.
+Client: ClientApp(client_fn -> NumPyClient, mods=[...]). Level 1: no mods. Level 2: [LocalDpMod].
+        Level 3: [secaggplus_mod, noise_share_mod] (noise_share_mod runs inside secaggplus_mod).
 """
 from __future__ import annotations
 
@@ -13,18 +13,21 @@ import time
 from collections import defaultdict
 
 from flwr.app import Context
+from flwr.client.mod import LocalDpMod, secaggplus_mod
 from flwr.clientapp import ClientApp
 from flwr.common.serde import recorddict_to_proto
 from flwr.server import ServerConfig
 from flwr.server.compat import LegacyContext
-from flwr.server.workflow import DefaultWorkflow
+from flwr.server.workflow import DefaultWorkflow, SecAggPlusWorkflow
 from flwr.server.workflow.constant import MAIN_CONFIGS_RECORD, Key
 from flwr.server.workflow.default_workflows import default_fit_workflow
 from flwr.serverapp import Grid, ServerApp
 
 import common
 from train.client import make_client_fn
+from train.env import machine_info
 from train.fedsgd import FedSGD
+from train.noise_share_mod import NoiseShareMod
 from train.recorder import rounds_to_record, save_recording
 from train.settings import RunSettings
 
@@ -52,6 +55,14 @@ class MeteredGrid:
         return replies
 
 
+CSV_COLUMNS = ["round", "val_mse", "round_time_s", "bytes_per_house", "is_warmup", "clipping_range_cuts"]
+
+
+class ClippingRangeExceeded(RuntimeError):
+    """Some values of the protected updates were beyond the SecAgg+ clipping_range, so SecAgg+
+    would have cut them silently. The run is refused: raise calibration.clipping_range."""
+
+
 class RoundRunner:
     """Fit workflow wrapper: times one round, reads the byte meter, logs val MSE, and writes the
     recordings. Timing covers only the inner Flower fit workflow (send, local updates, receive,
@@ -63,7 +74,7 @@ class RoundRunner:
         self.csv_path = s.logs_dir / f"{s.run_name}.csv"
         s.logs_dir.mkdir(parents=True, exist_ok=True)
         with open(self.csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(["round", "val_mse", "round_time_s", "bytes_per_house"])
+            csv.writer(f).writerow(CSV_COLUMNS)
         self.recorded: list[str] = []
 
     def __call__(self, grid, context: LegacyContext) -> None:
@@ -81,17 +92,26 @@ class RoundRunner:
         bytes_per_house = sum(sent) / len(sent)
 
         val = self.strategy.val_mse()
+        cuts = self.strategy.last_round["clip_cuts"]   # None at levels 1-2
         with open(self.csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([r, f"{val:.8g}", f"{round_time:.6f}", f"{bytes_per_house:g}"])
+            # Round 1 is the warm-up (it includes Ray starting the client actors); the reported running
+            # cost is the median round_time_s over rounds 2..T (train.costs.running_cost).
+            csv.writer(f).writerow([r, f"{val:.8g}", f"{round_time:.6f}", f"{bytes_per_house:g}",
+                                    r == 1, "" if cuts is None else cuts])
         print(f"[{self.s.run_name}] round {r}/{self.s.T} val_mse={val:.6g} "
-              f"time={round_time:.3f}s bytes/house={bytes_per_house:g}", flush=True)
+              f"time={round_time:.3f}s bytes/house={bytes_per_house:g}"
+              + ("" if cuts is None else f" clipping_range_cuts={cuts}"), flush=True)
+        if cuts:
+            raise ClippingRangeExceeded(
+                f"[{self.s.run_name}] round {r}: {cuts} values of the protected updates exceed the SecAgg+ "
+                f"clipping_range {self.s.clipping_range}; SecAgg+ would cut them. Raise calibration.clipping_range.")
 
         if r in self.record_rounds:
             self.recorded.append(str(save_recording(self.s, self.strategy.last_round, round_time, bytes_per_house)))
         if r == self.s.T:
             test = self.strategy.test_error_kwh()
             with open(self.s.logs_dir / f"{self.s.run_name}_test.json", "w") as f:
-                json.dump({"round": r, **test}, f, indent=2)
+                json.dump({"round": r, **test, "env": machine_info()}, f, indent=2)
             print(f"[{self.s.run_name}] test MAE={test['test_mae_kwh']:.4f} kWh "
                   f"RMSE={test['test_rmse_kwh']:.4f} kWh", flush=True)
 
@@ -105,15 +125,40 @@ def make_server_app(s: RunSettings) -> ServerApp:
         strategy = FedSGD(s, common.Model().state_dict())
         legacy = LegacyContext(context=context, config=ServerConfig(num_rounds=s.T), strategy=strategy)
         meter = MeteredGrid(grid)
-        inner = default_fit_workflow  # level 3: SecAggPlusWorkflow(...)
+        inner = secaggplus_workflow(s) if s.level == 3 else default_fit_workflow
         DefaultWorkflow(fit_workflow=RoundRunner(s, inner, strategy, meter))(meter, legacy)
 
     return app
 
 
+def secaggplus_workflow(s: RunSettings) -> SecAggPlusWorkflow:
+    """SecAgg+ with config.yaml's num_shares, reconstruction_threshold and clipping_range. Quantisation
+    and modulus stay at Flower's defaults unless config.yaml sets them."""
+    kw = {}
+    if s.quantization_range is not None:
+        kw["quantization_range"] = int(s.quantization_range)
+    if s.modulus_range is not None:
+        kw["modulus_range"] = int(s.modulus_range)
+    return SecAggPlusWorkflow(num_shares=s.num_shares, reconstruction_threshold=s.reconstruction_threshold,
+                              clipping_range=s.clipping_range, **kw)
+
+
+def client_mods(s: RunSettings) -> list:
+    if s.level == 1:
+        return []
+    if s.level == 2:
+        # The client returns w - lr*g, so "returned minus received" is -lr*g. Clipping it to lr*C and
+        # noising with sensitivity lr*C is, in gradient terms, clip to C + N(0, sigma_for(eps, C, delta)^2).
+        lc = s.lr * s.C
+        return [LocalDpMod(clipping_norm=lc, sensitivity=lc, epsilon=s.eps, delta=s.delta)]
+    if s.level == 3:
+        return [secaggplus_mod, NoiseShareMod(C=s.C, sigma=s.sigma, n=s.n, run_seed=s.run_seed,
+                                              clipping_range=s.clipping_range)]
+    raise ValueError(f"unknown level {s.level}")
+
+
 def make_client_app(s: RunSettings) -> ClientApp:
-    mods = []  # level 3: [secaggplus_mod, noise_share_mod]
-    return ClientApp(client_fn=make_client_fn(s), mods=mods)
+    return ClientApp(client_fn=make_client_fn(s), mods=client_mods(s))
 
 
 def backend_config(s: RunSettings) -> dict:

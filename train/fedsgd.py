@@ -4,9 +4,12 @@ It is a legacy Strategy on purpose: flwr 1.45.0's SecAggPlusWorkflow only drives
 LegacyContext's Strategy (configure_fit in its setup stage, aggregate_fit after unmasking), so
 level 3 reuses this class unchanged.
 
-Updates are gradients (see common.local_update). Each round:
-    aggregate   = mean of the client updates (every client reports the same weight)
+Updates are gradients (see common.local_update). Each round, at every level:
+    aggregate   = mean of the client gradients (every client reports the same weight)
     new weights = old weights - lr * aggregate
+
+Level 1: each reply is a gradient. Level 2: each reply is LocalDpMod's noised new weights,
+converted back to a gradient g_hat = (w - returned)/lr. Level 3: SecAgg+ gives the mean directly.
 """
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ from flwr.server.strategy import Strategy
 
 import common
 import data
+from train.noise_share_mod import METRICS_KEY
 from train.settings import RunSettings
 
 
@@ -97,19 +101,41 @@ class FedSGD(Strategy):
         if len(weights) != 1:
             raise RuntimeError(f"clients reported different weights {weights}")
 
-        # Levels 1-2: one update per house; order the rows as house_ids.
-        by_house = {}
-        for _, fr in results:
-            hid = str(fr.metrics["house_id"])
-            (arr,) = parameters_to_ndarrays(fr.parameters)
-            by_house[hid] = torch.from_numpy(np.array(arr, copy=True))
-        if sorted(by_house) != sorted(self.s.house_ids) or len(results) != self.s.n:
+        houses = [str(fr.metrics["house_id"]) for _, fr in results]
+        if sorted(houses) != sorted(self.s.house_ids) or len(results) != self.s.n:
             raise RuntimeError(f"round {server_round}: results do not cover the neighbourhood exactly once")
-        server_view = torch.stack([by_house[h] for h in self.s.house_ids])  # [n, P]
-        # (Level 3: SecAggPlusWorkflow hands every result the same unmasked aggregate, so this
-        # branch will take the single [P] vector instead; see README "Flower wiring".)
+        clip_cuts = None
 
-        aggregate = server_view.mean(dim=0)
+        if self.s.level in (1, 2):
+            # One reply per house; order the rows as house_ids.
+            by_house = {}
+            for _, fr in results:
+                arrs = parameters_to_ndarrays(fr.parameters)
+                if self.s.level == 1:
+                    (arr,) = arrs
+                    row = torch.from_numpy(np.array(arr, copy=True))
+                else:
+                    # Level 2: the reply is LocalDpMod's noised NEW weights. Back to gradient space:
+                    # g_hat = (w - returned) / lr  (computed in float64, stored as float32).
+                    returned = torch.cat([torch.from_numpy(np.asarray(a, dtype=np.float64)).reshape(-1)
+                                          for a in arrs])
+                    row = ((rs["weights"].double() - returned) / self.s.lr).float()
+                by_house[str(fr.metrics["house_id"])] = row
+            server_view = torch.stack([by_house[h] for h in self.s.house_ids])  # [n, P]
+            aggregate = server_view.mean(dim=0)
+        else:
+            # Level 3: SecAggPlusWorkflow sets every result's parameters to the same unmasked,
+            # de-quantised aggregate, which is the MEAN of the n updates (equal weights).
+            first = parameters_to_ndarrays(results[0][1].parameters)
+            for _, fr in results[1:]:
+                other = parameters_to_ndarrays(fr.parameters)
+                if len(other) != len(first) or not all(np.array_equal(a, b) for a, b in zip(first, other)):
+                    raise RuntimeError(f"round {server_round}: SecAgg+ results do not share one aggregate")
+            server_view = torch.cat([torch.from_numpy(np.asarray(a, dtype=np.float64)).reshape(-1)
+                                     for a in first]).float()                 # [P]
+            aggregate = server_view
+            clip_cuts = sum(int(fr.metrics.get(METRICS_KEY, 0)) for _, fr in results)
+
         new = rs["weights"] - self.s.lr * aggregate
         self.current = new
         self.last_round = {
@@ -117,6 +143,7 @@ class FedSGD(Strategy):
             "global_model": common.unflatten(rs["weights"].clone(), self.template),
             "server_view": server_view,
             "dates": list(rs["dates"]),
+            "clip_cuts": clip_cuts,  # level 3: values beyond the SecAgg+ clipping_range, summed over houses
         }
         return ndarrays_to_parameters(to_ndarrays(common.unflatten(new, self.template))), {}
 

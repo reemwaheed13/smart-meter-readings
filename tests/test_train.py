@@ -102,11 +102,14 @@ def test_load_recording_rejects_bad_files(tmp_path):
         "global_model": common.Model().state_dict(), "true_windows": torch.zeros(2, 4, 96),
         "house_ids": ["a", "b"], "dates": ["2013-01-02"] * 4, "lr": 0.1, "C": None, "sigma": None,
         "round_time_s": 0.1, "bytes_per_house": 100.0,
+        "env": {"python": "3.12.3", "flwr": "1.45.0", "torch": "2.15.0", "cpu_model": "x", "cpu_cores": 2,
+                "gpu_visible": False},
     }
     torch.save(good, tmp_path / "ok.pt")
     load_recording(tmp_path / "ok.pt")
     for bad in ({"server_view": torch.zeros(3, P)}, {"true_windows": torch.zeros(2, 3, 96)},
-                {"view_is_sum": True}, {"dates": ["2013-01-02"] * 3}, {"house_ids": ["a"]}):
+                {"view_is_sum": True}, {"dates": ["2013-01-02"] * 3}, {"house_ids": ["a"]},
+                {"env": {}}, {"level": 3, "C": 1.0, "sigma": 0.0}):
         torch.save({**good, **bad}, tmp_path / "bad.pt")
         with pytest.raises(ValueError):
             load_recording(tmp_path / "bad.pt")
@@ -135,7 +138,10 @@ def test_csv_log(sim3):
     with open(sim3.logs_dir / "L1_eps0_n5_nb0.csv") as f:
         rows = list(csv.DictReader(f))
     assert [int(r["round"]) for r in rows] == [1, 2, 3]
-    assert list(rows[0]) == ["round", "val_mse", "round_time_s", "bytes_per_house"]
+    assert list(rows[0]) == ["round", "val_mse", "round_time_s", "bytes_per_house", "is_warmup",
+                             "clipping_range_cuts"]
+    assert [r["is_warmup"] for r in rows] == ["True", "False", "False"]
+    assert all(r["clipping_range_cuts"] == "" for r in rows)  # level 1: no SecAgg+
     assert all(float(r["val_mse"]) > 0 and float(r["round_time_s"]) > 0 for r in rows)
     assert (sim3.logs_dir / "L1_eps0_n5_nb0_test.json").exists()
 
@@ -168,7 +174,7 @@ def test_rerun_is_deterministic(sim3, sim3_rerun):
             x, y = a[r][k], b[r][k]
             if isinstance(x, torch.Tensor):
                 assert torch.equal(x, y), (r, k)
-            elif isinstance(x, dict):
+            elif k == "global_model":
                 assert all(torch.equal(x[j], y[j]) for j in x), (r, k)
             else:
                 assert x == y, (r, k)

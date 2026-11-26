@@ -53,7 +53,10 @@ dp:
     8: null
 
 secaggplus:
-  num_shares: 4
+  # Odd on purpose. flwr 1.45.0's SecAggPlusWorkflow.setup_stage bumps an even num_shares (!= n) to
+  # num_shares+1 for the neighbour ring AFTER it has sent the even value to the clients, which then
+  # crash (IndexError in secaggplus_mod._share_keys). 5 is what Flower itself would use for 4.
+  num_shares: 5
   reconstruction_threshold: 3
   clipping_range: null           # taken from calibration.clipping_range
   # Quantisation and modulus are left at the Flower defaults (flwr==1.45.0,
@@ -68,7 +71,13 @@ secaggplus:
 simulation:
   # Flower simulation (flwr.simulation.run_simulation, Ray backend).
   client_num_cpus: 2             # Ray CPUs per client actor (Flower's default)
-  client_weight: 1               # num_examples every client reports; identical for all, so no client counts more
+  # num_examples every client reports; identical for all, so no client counts more. It equals
+  # SecAgg+'s default max_weight (1000.0) on purpose: SecAgg+ multiplies each update by
+  # num_examples/max_weight before clipping and quantising it, so with this value that factor is
+  # exactly 1. The quantisation step is then 2*clipping_range/2**22, and SecAgg+ clips at exactly
+  # clipping_range. (With weight 1 the factor would be ~0.001: about 1000x coarser quantisation.)
+  # FedSGD ignores the value beyond checking that all clients report the same one.
+  client_weight: 1000
 
 paths:                           # relative to the repository root
   recordings: recordings         # attack recordings (gitignored; shared Drive)

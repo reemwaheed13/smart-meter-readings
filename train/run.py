@@ -1,27 +1,78 @@
-"""Entry point: python -m train.run --level 1 --eps none --n 5 --k 0 [--lr 0.1 --T 10]
+"""Entry point: python -m train.run --level 2 --eps 1 --n 5 --k 0 [--out DIR] [--lr 0.1 --T 10 --C 1.0 --clipping-range 8.0]
 
 Launches a Flower simulation (flwr.simulation.run_simulation, Ray backend) with n clients.
---lr and --T are accepted only while calibration.lr / calibration.T[n] are null in config.yaml.
+--lr, --T, --C and --clipping-range are accepted only while the matching calibration value in
+config.yaml is null.
+
+--out DIR puts recordings/ and logs/ under DIR. Runs are resumable: a run whose recordings and
+logs all exist in DIR and pass load_recording is skipped. A partial run (some of its files exist)
+is deleted and rerun from scratch.
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import pickle
 import sys
 
 from flwr.simulation import run_simulation
 
+from attacks.recording import load_recording
 from train.app import backend_config, make_client_app, make_server_app
+from train.recorder import recording_path, rounds_to_record
 from train.settings import RunSettings, resolve
 
 
+def run_files(s: RunSettings) -> list:
+    """Every file a complete run writes: the recordings, the CSV log and the test JSON."""
+    return ([recording_path(s, r) for r in rounds_to_record(s.T)]
+            + [s.logs_dir / f"{s.run_name}.csv", s.logs_dir / f"{s.run_name}_test.json"])
+
+
+def is_complete(s: RunSettings) -> bool:
+    """True if every file of the run exists, every recording passes load_recording and matches the
+    run, and the CSV has rounds 1..T."""
+    files = run_files(s)
+    if not all(p.exists() for p in files):
+        return False
+    try:
+        for r in rounds_to_record(s.T):
+            rec = load_recording(recording_path(s, r))
+            if (rec["level"], rec["eps"], rec["n"], rec["nb"], rec["round"]) != (s.level, s.eps, s.n, s.k, r):
+                return False
+        with open(s.logs_dir / f"{s.run_name}.csv", newline="") as f:
+            rounds = [int(row["round"]) for row in csv.DictReader(f)]
+    except (ValueError, KeyError, OSError, RuntimeError, pickle.UnpicklingError, EOFError):
+        return False
+    return rounds == list(range(1, s.T + 1))
+
+
 def run(s: RunSettings) -> None:
-    print(f"[{s.run_name}] houses={list(s.house_ids)} T={s.T} lr={s.lr} run_seed={s.run_seed}", flush=True)
+    print(f"[{s.run_name}] houses={list(s.house_ids)} T={s.T} lr={s.lr} C={s.C} sigma={s.sigma} "
+          f"run_seed={s.run_seed}", flush=True)
     run_simulation(
         server_app=make_server_app(s),
         client_app=make_client_app(s),
         num_supernodes=s.n,
         backend_config=backend_config(s),
     )
+    if not is_complete(s):
+        raise RuntimeError(f"[{s.run_name}] the simulation ended but the run's files are incomplete")
+
+
+def run_resumable(s: RunSettings) -> bool:
+    """Skip a complete run (returns False); otherwise delete any partial files and run (returns True)."""
+    if is_complete(s):
+        print(f"[{s.run_name}] complete in {s.logs_dir.parent}, skipping", flush=True)
+        return False
+    for p in run_files(s):
+        if p.exists():
+            print(f"[{s.run_name}] partial run: deleting {p}", flush=True)
+            p.unlink()
+    for p in s.recordings_dir.glob(f"{s.run_name}_r*.pt") if s.recordings_dir.exists() else []:
+        p.unlink()
+    run(s)
+    return True
 
 
 def main(argv=None) -> int:
@@ -31,15 +82,20 @@ def main(argv=None) -> int:
     p.add_argument("--eps", required=True, help="'none' or a number")
     p.add_argument("--n", type=int, required=True)
     p.add_argument("--k", type=int, required=True)
+    p.add_argument("--out", default=None, help="output directory; recordings/ and logs/ go under it")
     p.add_argument("--lr", type=float, default=None, help="only while calibration.lr is null")
     p.add_argument("--T", type=int, default=None, help="only while calibration.T[n] is null")
+    p.add_argument("--C", type=float, default=None, help="only while calibration.C is null (levels 2-3)")
+    p.add_argument("--clipping-range", type=float, default=None,
+                   help="only while calibration.clipping_range is null (level 3)")
     a = p.parse_args(argv)
     try:
-        s = resolve(a.level, a.eps, a.n, a.k, lr=a.lr, T=a.T)
+        s = resolve(a.level, a.eps, a.n, a.k, lr=a.lr, T=a.T, C=a.C, clipping_range=a.clipping_range,
+                    out_dir=a.out)
     except (ValueError, NotImplementedError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    run(s)
+    run_resumable(s)
     return 0
 
 

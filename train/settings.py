@@ -1,8 +1,8 @@
 """Resolve the settings of one training run from config.yaml (plus the calibration overrides).
 
-config.yaml is the single source of settings. The only overrides are --lr and --T, and they are
-accepted ONLY while the matching calibration value in config.yaml is still null. A needed value
-that is null with no override is an error: the run refuses to start.
+config.yaml is the single source of settings. The only overrides are --lr, --T, --C and
+--clipping-range, and each is accepted ONLY while the matching calibration value in config.yaml is
+still null. A needed value that is null with no override is an error: the run refuses to start.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import data
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-IMPLEMENTED_LEVELS = (1,)  # levels 2 and 3 are added in later stages
+IMPLEMENTED_LEVELS = (1, 2, 3)
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,8 @@ class RunSettings:
     lr: float
     T: int
     C: float | None            # None at level 1 (no clipping)
-    sigma: float | None        # None at level 1 (no noise)
+    sigma: float | None        # None at level 1; 0.0 at level 3 with eps = none
+    delta: float
     run_seed: int
     house_ids: tuple[str, ...]  # client i (partition id i) is house_ids[i]
     windows_per_round: int
@@ -34,6 +35,14 @@ class RunSettings:
     client_num_cpus: float
     recordings_dir: Path
     logs_dir: Path
+    # SecAgg+ (level 3 only). None = Flower default.
+    num_shares: int | None = None
+    reconstruction_threshold: int | None = None
+    clipping_range: float | None = None
+    quantization_range: int | None = None
+    modulus_range: int | None = None
+    # TEST-ONLY hook: every client sends an all-zero gradient (used to measure the noise alone).
+    test_zero_update: bool = False
 
     @property
     def eps_label(self) -> str:
@@ -57,23 +66,33 @@ def parse_eps(s: str | float | None) -> float | None:
 
 def _calibrated(name: str, cfg_value, override):
     """The config value if it is set; otherwise the override. Refuse both-set and neither-set."""
+    flag = "--" + name.replace("_", "-")
     if cfg_value is not None:
         if override is not None:
             raise ValueError(
                 f"config.yaml already sets calibration {name} = {cfg_value}; "
-                f"--{name} is only accepted while it is null. Remove --{name}.")
+                f"{flag} is only accepted while it is null. Remove {flag}.")
         return cfg_value
     if override is None:
         raise ValueError(
-            f"calibration {name} is null in config.yaml and no --{name} override was given; refusing to run.")
+            f"calibration {name} is null in config.yaml and no {flag} override was given; refusing to run.")
     return override
 
 
 def resolve(level: int, eps, n: int, k: int, *, lr: float | None = None, T: int | None = None,
+            C: float | None = None, clipping_range: float | None = None,
+            out_dir: str | Path | None = None,
             recordings_dir: str | Path | None = None, logs_dir: str | Path | None = None,
-            config_path: str | Path = "config.yaml") -> RunSettings:
+            config_path: str | Path = "config.yaml", rounds: int | None = None,
+            test_zero_update: bool = False) -> RunSettings:
+    """Settings for one run.
+
+    out_dir: if given, recordings and logs go to out_dir/recordings and out_dir/logs (unless
+        recordings_dir / logs_dir are given explicitly).
+    rounds: run exactly this many rounds, ignoring calibration.T (timing test only).
+    """
     cfg = common.load_config(config_path)
-    exp, cal = cfg["experiment"], cfg["calibration"]
+    exp, cal, dp, sa = cfg["experiment"], cfg["calibration"], cfg["dp"], cfg["secaggplus"]
     eps = parse_eps(eps)
 
     if level not in exp["levels"]:
@@ -82,30 +101,63 @@ def resolve(level: int, eps, n: int, k: int, *, lr: float | None = None, T: int 
         raise NotImplementedError(f"level {level} is not implemented yet (only {IMPLEMENTED_LEVELS})")
     if level == 1 and eps is not None:
         raise ValueError("level 1 has no noise: use --eps none")
+    if level == 2 and eps is None:
+        raise ValueError("level 2 (local DP) needs a number for --eps")
     if exp["clients_per_round"] != "all":
         raise ValueError("only clients_per_round: all is supported (every house takes part every round)")
 
     lr = float(_calibrated("lr", cal["lr"], lr))
-    T = int(_calibrated("T", (cal["T"] or {}).get(n), T))
+    if rounds is not None:
+        if T is not None:
+            raise ValueError("give either rounds or T, not both")
+        T = int(rounds)
+    else:
+        T = int(_calibrated("T", (cal["T"] or {}).get(n), T))
     if lr <= 0 or T < 1:
         raise ValueError(f"need lr > 0 and T >= 1, got lr={lr}, T={T}")
 
-    # Level 1 uses neither clipping nor noise. Levels 2-3 will read calibration.C and dp.sigma here
-    # (and refuse to run while they are null).
-    C = sigma = None
+    delta = float(dp["delta"])
+    Cv = sigma = None
+    sec = {}
+    if level in (2, 3):
+        Cv = float(_calibrated("C", cal["C"], C))
+        if Cv <= 0:
+            raise ValueError(f"need C > 0, got {Cv}")
+        cfg_sigma = None if eps is None else (dp.get("sigma") or {}).get(int(eps) if float(eps).is_integer() else eps)
+        sigma = float(cfg_sigma) if cfg_sigma is not None else common.sigma_for(eps, Cv, delta)
+    elif C is not None or clipping_range is not None:
+        raise ValueError("--C / --clipping-range only apply to levels 2 and 3")
+    if level == 2 and clipping_range is not None:
+        raise ValueError("--clipping-range only applies to level 3 (SecAgg+)")
+    if level == 3:
+        cr = float(_calibrated("clipping_range", cal["clipping_range"], clipping_range))
+        if sa.get("clipping_range") is not None and float(sa["clipping_range"]) != cr:
+            raise ValueError(f"secaggplus.clipping_range ({sa['clipping_range']}) differs from "
+                             f"calibration.clipping_range ({cr})")
+        sec = dict(num_shares=int(sa["num_shares"]), reconstruction_threshold=int(sa["reconstruction_threshold"]),
+                   clipping_range=cr, quantization_range=sa.get("quantization_range"),
+                   modulus_range=sa.get("modulus_range"))
+        if n < sec["num_shares"]:
+            raise ValueError(f"SecAgg+ needs n >= num_shares ({sec['num_shares']}), got n={n}")
 
     paths = cfg["paths"]
+    if out_dir is not None:
+        out = Path(out_dir)
+        recordings_dir = recordings_dir if recordings_dir is not None else out / "recordings"
+        logs_dir = logs_dir if logs_dir is not None else out / "logs"
     rec = Path(recordings_dir if recordings_dir is not None else paths["recordings"])
     logs = Path(logs_dir if logs_dir is not None else paths["logs"])
     rec = rec if rec.is_absolute() else _REPO_ROOT / rec
     logs = logs if logs.is_absolute() else _REPO_ROOT / logs
 
     return RunSettings(
-        level=level, eps=eps, n=n, k=k, lr=lr, T=T, C=C, sigma=sigma,
+        level=level, eps=eps, n=n, k=k, lr=lr, T=T, C=Cv, sigma=sigma, delta=delta,
         run_seed=common.run_seed(n, k),
         house_ids=tuple(data.get_neighbourhood(n, k)),
         windows_per_round=int(exp["windows_per_round"]),
         num_examples=int(cfg["simulation"]["client_weight"]),
         client_num_cpus=float(cfg["simulation"]["client_num_cpus"]),
         recordings_dir=rec, logs_dir=logs,
+        test_zero_update=bool(test_zero_update),
+        **sec,
     )

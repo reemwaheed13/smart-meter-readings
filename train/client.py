@@ -1,4 +1,17 @@
-"""The house (Flower client): one FedSGD gradient per round on its own 4 windows."""
+"""The house (Flower client): one FedSGD gradient per round on its own 4 windows.
+
+What the client returns depends on the level (see README, "Flower wiring"):
+
+- level 1: the gradient g, flat [P] (common.protect at level 1 returns it unchanged).
+- level 2: its NEW weights w - lr*g, one array per state_dict tensor. Flower's LocalDpMod then
+  clips "returned minus received" (= -lr*g, the true update) to lr*C and adds its noise.
+- level 3: the raw gradient g, flat [P]. noise_share_mod clips it and adds the noise share,
+  then secaggplus_mod quantises and masks it.
+
+Just before returning, the client seeds numpy's global generator from (run_seed, round,
+partition id). LocalDpMod's noise (level 2) and SecAgg+'s stochastic rounding (level 3) both
+draw from numpy's global generator, so this makes them reproducible.
+"""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -10,13 +23,8 @@ from flwr.client import NumPyClient
 
 import common
 import data
+from train.noise_share_mod import noise_seed
 from train.settings import RunSettings
-
-
-def noise_seed(run_seed: int, server_round: int, partition_id: int) -> int:
-    """Seed of the generator a house uses for its DP noise in one round. Derived from run_seed,
-    so the noise is reproducible (unused at level 1: protect() returns the update unchanged)."""
-    return int(np.random.SeedSequence([run_seed, server_round, partition_id]).generate_state(1)[0])
 
 
 def weights_from_ndarrays(arrays: list[np.ndarray]) -> "OrderedDict[str, torch.Tensor]":
@@ -35,8 +43,10 @@ class HouseClient(NumPyClient):
 
     def fit(self, parameters, config):
         s = self.s
+        server_round = int(config["server_round"])
+        weights = weights_from_ndarrays(parameters)
         model = common.Model()
-        model.load_state_dict(weights_from_ndarrays(parameters))
+        model.load_state_dict(weights)
 
         dates = str(config["dates"]).split(",")
         if len(dates) != s.windows_per_round:
@@ -44,11 +54,24 @@ class HouseClient(NumPyClient):
         windows = data.get_windows([self.house_id], dates, "train")[0]  # [4, 96]
 
         update = common.local_update(model, windows, s.lr)              # flat [P] gradient
-        gen = torch.Generator().manual_seed(noise_seed(s.run_seed, int(config["server_round"]), self.pid))
-        update = common.protect(update, s.level, s.C, s.sigma, s.n, generator=gen)
+        if s.test_zero_update:                                          # TEST-ONLY hook
+            update = torch.zeros_like(update)
+        seed = noise_seed(s.run_seed, server_round, self.pid)
 
+        if s.level == 1:
+            gen = torch.Generator().manual_seed(seed)
+            out = [common.protect(update, 1, s.C, s.sigma, s.n, generator=gen).numpy()]
+        elif s.level == 2:
+            new = common.flatten(weights) - s.lr * update               # w - lr*g
+            out = [t.numpy() for t in common.unflatten(new, weights).values()]
+        elif s.level == 3:
+            out = [update.numpy()]                                      # noise_share_mod protects it
+        else:
+            raise ValueError(f"unknown level {s.level}")
+
+        np.random.seed(seed)  # immediately before returning: LocalDpMod / SecAgg+ rounding draw from it
         # Same weight for every house: no client counts more in the aggregate.
-        return [update.numpy()], s.num_examples, {"house_id": self.house_id}
+        return out, s.num_examples, {"house_id": self.house_id}
 
 
 def make_client_fn(s: RunSettings):

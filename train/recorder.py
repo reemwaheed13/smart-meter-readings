@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 import data
+from train.env import machine_info
 from train.settings import RunSettings
 
 
@@ -29,8 +30,9 @@ def save_recording(s: RunSettings, last_round: dict, round_time_s: float, bytes_
         "nb": s.k,
         "round": r,
         "server_view": last_round["server_view"],
-        # Only meaningful at level 3, where the server sees one aggregate [P] instead of [n, P].
-        "view_is_sum": s.level == 3,
+        # Always False: at level 3 Flower's SecAgg+ aggregate is the MEAN of the n updates, not
+        # their sum (attacks multiply it by n). Levels 1-2 have one row per house.
+        "view_is_sum": False,
         "global_model": last_round["global_model"],
         # Ground truth for scoring the attacks. Attack code must never receive it as an input.
         "true_windows": data.get_windows(list(s.house_ids), dates, "train"),
@@ -41,6 +43,7 @@ def save_recording(s: RunSettings, last_round: dict, round_time_s: float, bytes_
         "sigma": s.sigma,
         "round_time_s": float(round_time_s),
         "bytes_per_house": float(bytes_per_house),
+        "env": machine_info(),
     }
     path = recording_path(s, r)
     path.parent.mkdir(parents=True, exist_ok=True)

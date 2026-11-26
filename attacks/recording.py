@@ -11,8 +11,10 @@ import common
 
 KEYS = {
     "level", "eps", "n", "nb", "round", "server_view", "view_is_sum", "global_model",
-    "true_windows", "house_ids", "dates", "lr", "C", "sigma", "round_time_s", "bytes_per_house",
+    "true_windows", "house_ids", "dates", "lr", "C", "sigma", "round_time_s", "bytes_per_house", "env",
 }
+# Machine and library info of the run (train/env.py): field -> type.
+ENV_FIELDS = {"python": str, "flwr": str, "torch": str, "cpu_model": str, "cpu_cores": int, "gpu_visible": bool}
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -59,8 +61,10 @@ def load_recording(path: str | Path) -> dict:
     if level in (1, 2) and vis:
         _fail(path, "view_is_sum must be False at levels 1-2")
 
+    # Levels 1-2: one row per house. Level 3: the single SecAgg+ aggregate (a mean if view_is_sum
+    # is False, as Flower 1.45.0 returns it; multiply by n for the sum).
     sv = rec["server_view"]
-    want = (P,) if vis else (n, P)
+    want = (P,) if level == 3 else (n, P)
     if not isinstance(sv, torch.Tensor) or tuple(sv.shape) != want or not sv.is_floating_point():
         _fail(path, f"server_view must be a float tensor {list(want)}, got "
                     f"{getattr(sv, 'shape', type(sv).__name__)}")
@@ -95,4 +99,10 @@ def load_recording(path: str | Path) -> dict:
         _fail(path, f"round_time_s must be >= 0, got {rec['round_time_s']!r}")
     if not (_is_num(rec["bytes_per_house"]) and rec["bytes_per_house"] > 0):
         _fail(path, f"bytes_per_house must be > 0, got {rec['bytes_per_house']!r}")
+    env = rec["env"]
+    if not isinstance(env, dict) or set(env) != set(ENV_FIELDS):
+        _fail(path, f"env must be a dict with keys {sorted(ENV_FIELDS)}")
+    for k, t in ENV_FIELDS.items():
+        if type(env[k]) is not t:
+            _fail(path, f"env[{k!r}] must be {t.__name__}, got {env[k]!r}")
     return rec

@@ -70,18 +70,21 @@ Everything runs on a PC, using [Flower](https://flower.ai) to simulate many hous
    | Level | Implementation | ε |
    |---|---|---|
    | 1. No protection | Plain Flower FL | none |
-   | 2. DP only | Flower local DP: each house clips its update and adds its own full noise on the client | 1, 8 |
+   | 2. DP only | Flower's built-in local DP (`LocalDpMod`): each house clips its update and adds its own full noise on the client | 1, 8 |
    | 3. DP with SecAgg | Flower's SecAgg+, plus our `noise_share_mod`, where each house adds its share of the noise before masking | 1, 8, and none (SecAgg+ alone) |
 
 3. **Attacks.** Run both attacks, TS-Inverse and the learned inverter, at every level, with neighbourhoods of 5, 10
-   and 20 houses. We start with the learned inverter, and implement TS-Inverse from the paper if no public code is
-   available.
+   and 20 houses. We start with the learned inverter, and use the authors' public code
+   (github.com/Capsar/ts-inverse, CC BY-SA 4.0), adapted to our model and to summed updates.
 4. **Measurements.** For each level, neighbourhood size and ε:
    - **Attack success, compared with blind guessing:** sMAPE of the reconstructed load curves; how well the
      attacker recovers routine timing; home/away detection; and, at level 3, how much each single house is
      exposed when the server sees only the neighbourhood total.
    - **Forecast error** in kWh.
-   - **Running cost:** time per round and bytes sent per house.
+   - **Running cost:** time per round and bytes sent per house. Round 1 is logged but flagged
+     `is_warmup = True` (it includes Ray starting the client actors). The reported time per round is the
+     **median `round_time_s` over rounds 2..T** (`train.costs.running_cost`).
+   - **Privacy:** the total ε over all T rounds from the zCDP accountant (`train/accountant.py`).
 
 Out of scope this semester: anything beyond a PC running Flower. The microcontroller and dropouts are future work
 (see below).
@@ -100,6 +103,7 @@ eval/              metrics and plots
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
 logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
+notebooks/         colab_run.ipynb (runs everything in Colab into a Drive folder)
 ```
 
 ## Install and test
@@ -113,26 +117,74 @@ pytest
 
 Install the CPU build of torch first, as shown, and then the requirements. requirements.txt installs
 `flwr[simulation]`, which brings in Ray: Ray is the only simulation backend in flwr 1.45.0. pytest runs real Flower
-simulations, so it takes about two minutes.
+simulations, so it takes about four minutes.
 
 ## Running
 
 ```bash
 python -m train.run --level 1 --eps none --n 5 --k 0 --lr 0.1 --T 10
+python -m train.run --level 2 --eps 1    --n 5 --k 0 --lr 0.1 --T 10 --C 1.0
+python -m train.run --level 3 --eps 8    --n 5 --k 0 --lr 0.1 --T 10 --C 1.0 --clipping-range 8.0 --out runs/
 ```
 
-`--lr` and `--T` are accepted only while `calibration.lr` / `calibration.T[n]` are null in config.yaml. Once
-calibration fills them in, the run takes them from config.yaml and refuses the flags. If a needed value is null
-and no flag is given, the run refuses to start. Each run writes:
+`--lr`, `--T`, `--C` and `--clipping-range` are accepted only while `calibration.lr` / `calibration.T[n]` /
+`calibration.C` / `calibration.clipping_range` are null in config.yaml. Once calibration fills them in, the run
+takes them from config.yaml and refuses the flags. If a needed value is null and no flag is given, the run refuses
+to start. σ is `dp.sigma[eps]` if set, otherwise `common.sigma_for(eps, C, delta)`.
 
-- `logs/L{level}_eps{eps}_n{n}_nb{k}.csv`, one row per round with `round, val_mse, round_time_s, bytes_per_house`.
+`--out DIR` puts `recordings/` and `logs/` under DIR (default: the repo's `recordings/` and `logs/`). Runs are
+**resumable**: a run whose recordings and both log files all exist in DIR, pass `load_recording` and cover rounds
+1..T is skipped. A partial run is deleted and rerun from scratch. Each run writes:
+
+- `logs/L{level}_eps{eps}_n{n}_nb{k}.csv`, one row per round with
+  `round, val_mse, round_time_s, bytes_per_house, is_warmup, clipping_range_cuts`.
   `val_mse` is the global model's MSE on the neighbourhood's val windows after the round. `round_time_s` is the wall
-  time of Flower's fit step for the round (send, local updates, receive, aggregate). Round 1 also includes Ray
-  starting the client actors, about 20–40 s. `bytes_per_house` is the measured serialised size of the message
-  content each house sends in the round, averaged over houses.
-- `logs/L{level}_eps{eps}_n{n}_nb{k}_test.json` with the test MAE and RMSE in kWh after round T.
+  time of Flower's fit step for the round (send, local updates, receive, aggregate; at level 3 all four SecAgg+
+  stages). `is_warmup` is True for round 1, which also includes Ray starting the client actors (about 20–40 s); the
+  reported running cost is the median `round_time_s` over rounds 2..T. `bytes_per_house` is the measured serialised
+  size of the message content each house sends in the round (all SecAgg+ stages at level 3), averaged over houses.
+  `clipping_range_cuts` (level 3 only, empty otherwise) is the number of values, over all houses, of the protected
+  updates with |x| > clipping_range. SecAgg+ would cut them silently, so **any count above 0 fails the run**
+  (`ClippingRangeExceeded`) after the row is logged.
+- `logs/L{level}_eps{eps}_n{n}_nb{k}_test.json` with the test MAE and RMSE in kWh after round T, and `env`
+  (below).
 - Recordings at rounds 1, ⌈T/2⌉ and T. The middle round is `(T+1)//2`, and duplicates are dropped, so T = 2
   writes rounds 1 and 2 only.
+
+Every recording and test JSON stores `env`: the python, flwr and torch versions, the CPU model, the core count and
+whether a GPU was visible (`train/env.py`).
+
+**Privacy table:** `python -m train.accountant --out DIR [--C 1.0 --T 10]` writes `DIR/privacy_table.csv`
+(`level, eps_per_round, sigma, T, eps_total`). Gaussian mechanism, sensitivity C, noise std σ, every house in every
+round, no subsampling: ρ per round = C²/(2σ²), total ρ = T·ρ, ε_total = ρ + 2√(ρ ln(1/δ)). The same holds at
+levels 2 and 3: at level 3 the sum carries total std σ, and one house moves the sum by at most C. eps = none gives
+ε_total = ∞. The per-round ε (1 or 8) is a label that sets σ through the classic Gaussian bound, which is only
+proven for ε < 1. The zCDP total is the reported guarantee.
+
+**Timing test:** `python -m train.timing_test --out DIR --T <rounds per run> [--lr --C --clipping-range]` runs
+50 rounds of level 3 (n = 20, eps = 1) and writes `DIR/timing.json`: the median `round_time_s` over rounds 2..50,
+`bytes_per_house`, `env`, and `projected_total_s = median × T × 27` (the 27 level-3 runs). Fake data is fine
+here: the cost does not depend on the readings.
+
+## Running in Colab
+
+`notebooks/colab_run.ipynb`. **Edit only the first cell** (`DRIVE_DIR`, the Drive folder for all outputs). Then
+run all cells. They:
+
+1. mount Google Drive;
+2. clone the repo into `/content/smart-meter-readings`, or pull if it is already there;
+3. `pip install flwr[simulation]==1.45.0 pyyaml==6.0.4`, keeping Colab's own torch and numpy;
+4. print the python, flwr, torch and numpy versions and the machine info;
+5. run `pytest`;
+6. run every (level, eps, n, k) with `python -m train.run ... --out DRIVE_DIR`. Runs are resumable, so after a
+   disconnect you just rerun the cell: complete runs are skipped and partial runs are redone. While config.yaml
+   is not calibrated, the cell passes the smoke overrides (`--lr 0.1 --T 10 --C 1.0 --clipping-range 8.0`) and
+   says so;
+7. run the timing test into `DRIVE_DIR/timing`;
+8. plot `val_mse` per round from `DRIVE_DIR/logs/*.csv`.
+
+Colab's torch is a different build from the pinned CPU one, so its version is recorded in every recording's
+`env`.
 
 ## Flower wiring (flwr 1.45.0)
 
@@ -156,29 +208,48 @@ notice in favour of the `flwr run` CLI, which runs the same `ServerApp`/`ClientA
   dates in the fit config. `aggregate_fit` takes the mean of the updates and applies `w -= lr * mean`.
 - `RoundRunner` times the inner fit workflow, then logs val MSE and writes the recordings.
 - `MeteredGrid.send_and_receive` adds up the protobuf size of every reply's content per node.
-- Level 1: `inner = flwr.server.workflow.default_workflows.default_fit_workflow`.
+- Levels 1–2: `inner = flwr.server.workflow.default_workflows.default_fit_workflow`. Level 3:
+  `inner = SecAggPlusWorkflow(...)`.
 
 **Client** (`train/client.py`): `ClientApp(client_fn=..., mods=[])`. `client_fn` maps
 `node_config["partition-id"]` i to `house_ids[i]` and returns a `NumPyClient`. Its `fit` returns
-`([update [P]], weight, {"house_id": ...})`, after `common.protect(update, level, C, sigma, n)`. Every house
-reports the same weight (`simulation.client_weight`).
+`(arrays, weight, {"house_id": ...})`. Every house reports the same weight (`simulation.client_weight` = 1000,
+see level 3). Just before returning, the client seeds numpy's global generator from
+`noise_seed(run_seed, round, partition id)`. LocalDpMod's noise (level 2) and SecAgg+'s stochastic rounding
+(level 3) both draw from it, so reruns give identical files.
 
-**Where level 2 hooks in:** in the client's `common.protect` call. At level 1 it returns the update unchanged.
-At level 2 it clips to C and adds N(0, σ²) from a run_seed generator, as the handshake says. Flower's
-`LocalDpMod` cannot be used as-is. It clips the *difference* between the parameters the client returns and the
-parameters it received, which assumes the client returns weights. Our client returns a gradient. Its noise also
-comes from numpy's global RNG, not from run_seed.
+**Level 2: Flower's built-in local DP (`LocalDpMod`).** `mods=[LocalDpMod(clipping_norm=lr·C, sensitivity=lr·C,
+epsilon=eps, delta=delta)]`. LocalDpMod clips "parameters returned minus parameters received" and then adds
+N(0, std²) with std = sensitivity·√(2 ln(1.25/δ))/ε from numpy's global RNG (read from the flwr 1.45.0 source,
+`flwr/supercore/differential_privacy.py: add_localdp_gaussian_noise_to_params`). So at level 2 the client
+returns its **new weights** w − lr·g instead of the gradient, which makes "returned minus received" the true update
+−lr·g. The server converts each reply back to gradient space, ĝ = (w − returned)/lr. Since the update is lr times
+the gradient, clipping it to lr·C is clipping g to C, and the noise std lr·C·√(2 ln(1.25/δ))/ε becomes exactly
+`sigma_for(eps, C, delta)` in gradient terms. `server_view [n, P]` holds the ĝ rows in `house_ids` order, and
+the aggregate step is the same FedSGD step as level 1, `w -= lr · mean(ĝ)`.
 
-**Where level 3 hooks in**, with no restructuring:
-- Server: `inner = SecAggPlusWorkflow(num_shares, reconstruction_threshold, clipping_range, ...)` from
-  config.yaml `secaggplus`.
-- Client: `mods=[secaggplus_mod, noise_share_mod]`. The first mod is the outermost, so `noise_share_mod` sees
-  the plaintext update before `secaggplus_mod` quantises and masks it. Clip and noise share must be applied
-  exactly once.
-- `FedSGD.aggregate_fit` then gets results whose parameters all hold the same unmasked vector. Flower divides
-  it by the total weight, so with equal weights it is the **mean** of the n updates, not their sum. That vector
-  becomes the `[P]` `server_view`.
-- `MeteredGrid` already counts the bytes of all four SecAgg+ stages.
+**Level 3: Flower's SecAgg+ plus our `noise_share_mod`.**
+- Server: `inner = SecAggPlusWorkflow(num_shares=5, reconstruction_threshold=3, clipping_range=...)`, with
+  quantisation and modulus at Flower's defaults (2²² and 2³²). `num_shares` is 5 rather than 4 because
+  flwr 1.45.0's `setup_stage` turns an even `num_shares` (≠ n) into `num_shares + 1` for the neighbour ring
+  *after* it has sent the even value to the clients, and the clients then crash with an IndexError in
+  `_share_keys`. 5 is what Flower itself would use for 4.
+- Client: `mods=[secaggplus_mod, NoiseShareMod(C, sigma, n, run_seed, clipping_range)]`
+  (`train/noise_share_mod.py`). The first mod is the outermost, so `noise_share_mod` sees the client's plaintext
+  gradient. It clips it to C and adds the noise share N(0, (σ/√n)²) via `common.protect(update, 3, ...)`, seeded
+  from (run_seed, round, partition id), before `secaggplus_mod` quantises and masks it. eps = none means clip only.
+  It also counts the values with |x| > clipping_range and reports the count in the fit metrics, which SecAgg+
+  forwards unmasked, so the server can log it and fail the run.
+- SecAgg+ multiplies each update by `num_examples / max_weight` before clipping it to ±clipping_range and quantising
+  it. `client_weight` is 1000 = Flower's default `max_weight`, so the factor is exactly 1: the quantisation step
+  is 2·clipping_range/2²² (3.8e-6 for 8.0) and SecAgg+ clips at exactly clipping_range. (With weight 1 the step
+  would be about 1000× coarser.)
+- `FedSGD.aggregate_fit` gets results whose parameters all hold the same unmasked, de-quantised vector. Flower
+  divides it by the total weight, so with equal weights it is the **mean** of the n protected updates, not their
+  sum (read from the 1.45.0 source and confirmed by `test_level3_view_times_n_is_sum_of_clipped_updates`). That
+  vector is the `[P]` `server_view`, recorded with `view_is_sum = False`. **Attacks multiply it by n** to get the
+  sum. The aggregate step is `w -= lr · server_view`.
+- `MeteredGrid` counts the bytes of all four SecAgg+ stages.
 
 ## Handshakes
 
@@ -234,9 +305,13 @@ recordings/L{level}_eps{eps}_n{n}_nb{k}_r{round}.pt
 | `lr`, `C`, `sigma` | |
 | `round_time_s` | |
 | `bytes_per_house` | |
+| `env` | dict: `python`, `flwr`, `torch` (str), `cpu_model` (str), `cpu_cores` (int), `gpu_visible` (bool) |
 
 `view_is_sum` only matters at level 3, where `server_view` is the single `[P]` aggregate instead of one row per
-house. It is always False at levels 1–2. At level 1, `C` and `sigma` are None (no clipping, no noise).
+house. It is always False at levels 1–2. At level 3 it is also False, because Flower's SecAgg+ aggregate is the
+**mean** of the n updates: attacks multiply `server_view` by n to get the sum. At level 2 `server_view` holds
+the gradient-space rows ĝ = (w − returned)/lr (see "Flower wiring"). At level 3 with eps = none, `sigma` is 0.0.
+`env` was added in Stage 4 by agreement. At level 1, `C` and `sigma` are None (no clipping, no noise).
 `attacks/recording.py: load_recording(path)` checks every key and shape. It loads with `weights_only=True`, so a
 file from the shared Drive cannot run code.
 
