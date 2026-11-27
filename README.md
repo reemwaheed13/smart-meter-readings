@@ -103,7 +103,7 @@ eval/              metrics and plots
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
 logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
-notebooks/         colab_run.ipynb (runs everything in Colab into a Drive folder)
+notebooks/         colab_run.ipynb (the Stage 4 check in Colab; outputs on Google Drive)
 ```
 
 ## Install and test
@@ -116,10 +116,16 @@ pytest
 ```
 
 Install the CPU build of torch first, as shown, and then the requirements. requirements.txt installs
-`flwr[simulation]`, which brings in Ray: Ray is the only simulation backend in flwr 1.45.0. pytest runs real Flower
-simulations, so it takes about four minutes.
+`flwr[simulation]`, which brings in Ray: Ray is the only simulation backend in flwr 1.45.0. pytest runs real
+(small) Flower simulations.
+
+**The local environment is for writing code and running pytest only.** Every real run (smoke runs, timing test,
+calibration and the experiment grid) happens in Colab through `notebooks/colab_run.ipynb`, with outputs on
+Google Drive (see "Running in Colab"). Times measured on a local machine are not the project's running cost.
 
 ## Running
+
+These are the commands the Colab notebook calls (shown here for reference; run them in Colab).
 
 ```bash
 python -m train.run --level 1 --eps none --n 5 --k 0 --lr 0.1 --T 10
@@ -140,7 +146,7 @@ to start. σ is `dp.sigma[eps]` if set, otherwise `common.sigma_for(eps, C, delt
   `round, val_mse, round_time_s, bytes_per_house, is_warmup, clipping_range_cuts`.
   `val_mse` is the global model's MSE on the neighbourhood's val windows after the round. `round_time_s` is the wall
   time of Flower's fit step for the round (send, local updates, receive, aggregate; at level 3 all four SecAgg+
-  stages). `is_warmup` is True for round 1, which also includes Ray starting the client actors (about 20–40 s); the
+  stages). `is_warmup` is True for round 1, which also includes Ray starting the client actors; the
   reported running cost is the median `round_time_s` over rounds 2..T. `bytes_per_house` is the measured serialised
   size of the message content each house sends in the round (all SecAgg+ stages at level 3), averaged over houses.
   `clipping_range_cuts` (level 3 only, empty otherwise) is the number of values, over all houses, of the protected
@@ -168,20 +174,45 @@ here: the cost does not depend on the readings.
 
 ## Running in Colab
 
-`notebooks/colab_run.ipynb`. **Edit only the first cell** (`DRIVE_DIR`, the Drive folder for all outputs). Then
-run all cells. They:
+`notebooks/colab_run.ipynb` does the whole Stage 4 check in one *Runtime → Run all*.
 
-1. mount Google Drive;
-2. clone the repo into `/content/smart-meter-readings`, or pull if it is already there;
-3. `pip install flwr[simulation]==1.45.0 pyyaml==6.0.4`, keeping Colab's own torch and numpy;
-4. print the python, flwr, torch and numpy versions and the machine info;
-5. run `pytest`;
-6. run every (level, eps, n, k) with `python -m train.run ... --out DRIVE_DIR`. Runs are resumable, so after a
-   disconnect you just rerun the cell: complete runs are skipped and partial runs are redone. While config.yaml
-   is not calibrated, the cell passes the smoke overrides (`--lr 0.1 --T 10 --C 1.0 --clipping-range 8.0`) and
-   says so;
-7. run the timing test into `DRIVE_DIR/timing`;
-8. plot `val_mse` per round from `DRIVE_DIR/logs/*.csv`.
+**One-time setup: the GitHub token.** The repo may be private, so the notebook clones it with a token that it
+reads from a Colab secret. In Colab: left sidebar → key icon (*Secrets*) → *Add new secret*. Use the name
+`GH_TOKEN` and, as the value, a GitHub personal access token with read access to
+`reemwaheed13/smart-meter-readings` (a fine-grained token with *Contents: read-only* is enough). Then switch on
+*Notebook access*. The notebook never prints the token, and it doesn't keep it in the clone's git remote. If the
+secret is missing, the clone cell prints these instructions and tries an anonymous clone, which works only for a
+public repo.
+
+**Run all.** The cells, in order:
+
+1. mount Google Drive and create `OUT = /content/drive/MyDrive/smart-meter-fl/stage4`. The same cell holds the
+   only settings: `T_PROJECTION` (default 100), `COMPUTE_BUDGET_H` (default 12) and `FORCE_TIMING`;
+2. clone `reemwaheed13/smart-meter-readings` into `/content/smart-meter-readings` with `GH_TOKEN`, or
+   `git pull --ff-only` if it is already there;
+3. `pip install flwr[simulation]==1.45.0 pyyaml==6.0.4` and nothing else, keeping Colab's own torch and
+   numpy. Then print python, torch, numpy, flwr and ray versions, CPU model, core count and GPU (or "none"),
+   and save them to `OUT/versions.json`;
+4. `pytest -q`. If any test fails, the notebook stops here;
+5. 10 smoke runs on the fake data, T = 10, `--lr 0.1 --C 1.0 --clipping-range 8.0` (each flag only where it
+   applies and while config.yaml has null), into `OUT/smoke`: L1 none n5; L2 1 n5, 8 n5, 1 n20; L3 1 n5,
+   8 n5, none n5, 1 n10, 1 n20, none n20. They are resumable: runs already complete on Drive are skipped.
+   A clipping_range cut fails its run, with a banner;
+6. print the smoke summary and save it to `OUT/smoke/smoke_summary.csv`. It has one row per run: level, eps,
+   n, bytes_per_house, round-1 time, median `round_time_s` over rounds 2..T, clipping cut count, and test MAE
+   and RMSE (kWh);
+7. the timing test (`train.timing_test`: 50 rounds, L3, n = 20, eps = 1) → `OUT/timing.json`. It prints the
+   median, the projected total = median × T × 27, and whether a T cap is needed against `COMPUTE_BUDGET_H`
+   (and if so, the largest T that fits). T is `calibration.T[20]` if set, otherwise `T_PROJECTION`. The cell
+   prints which one it used. A 50-round `timing.json` already on Drive is reused unless `FORCE_TIMING = True`;
+8. zip `OUT/smoke`, `timing.json` and `versions.json` into **`OUT/stage4_results.zip`**: send this back.
+   If any smoke run failed, the notebook ends with an error after the zip is written.
+
+Every cell is safe to re-run. After a disconnect, just *Run all* again.
+
+**Where outputs land** (all on Drive, under `OUT`): `versions.json`; `smoke/logs/`, `smoke/recordings/`,
+`smoke/smoke_summary.csv`; `timing.json` (its run's own logs and recordings go to `logs/` and `recordings/`);
+`stage4_results.zip`.
 
 Colab's torch is a different build from the pinned CPU one, so its version is recorded in every recording's
 `env`.
