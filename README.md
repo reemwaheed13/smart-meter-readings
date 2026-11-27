@@ -94,12 +94,14 @@ Out of scope this semester: anything beyond a PC running Flower. The microcontro
 ```
 config.yaml        every setting (single source of truth; nothing hard-coded elsewhere)
 common.py          shared model, local update, protection, seeds (used by clients AND attacks)
-data.py            data interface (currently a FAKE random stub, to be replaced by the real loader)
+data.py            data interface: routes to data_real.py (default) or data_fake.py (SMART_METER_DATA=fake)
+data_real.py       real London Smartmeter 2013 loader; `python data_real.py prepare` builds the cleaned .npz
+data_fake.py       random stand-in with the same interface (the tests use it)
 requirements.txt   exact pinned versions (flwr pinned: SecAgg+ APIs change between versions)
 data/              raw dataset files (gitignored, download locally)
 train/             Flower FedSGD: client, strategy, server/client apps, recorder, entry point (train.run)
 attacks/           learned inverter, TS-Inverse; recording.py loads and checks a recording
-eval/              metrics and plots
+eval/              blind guess, scoring, result tables and figures (see "Evaluation")
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
 logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
@@ -357,12 +359,63 @@ file from the shared Drive cannot run code.
 - `attacker_houses()` -> 500 IDs
 - `unscale(x)`
 
-The current data.py is a FAKE stub with random data, to be replaced by the real data.py.
+`data.py` only routes: with `SMART_METER_DATA` unset or `real` it loads `data_real.py`, with
+`SMART_METER_DATA=fake` it loads `data_fake.py`. `tests/conftest.py` sets `fake`, so pytest never needs the
+real data. `data.FAKE` says which one is loaded. The real loader reads the cleaned file
+`data.processed_file` (default `data/processed/clean_2013.npz`, gitignored); the env var
+`SMART_METER_PROCESSED` points it somewhere else, e.g. the copy on the shared Drive in Colab. If neither
+exists it stops with an error rather than falling back to fake data. In the real data, for one n the
+neighbourhoods k = 0, 1, 2 never share a house.
+
+### Attack output format
+
+One `torch.save({"rebuilt": tensor})` per recording per attack, scaled 0–1 like `true_windows`, at
+
+```
+attack_outputs/L{level}_eps{eps}_n{n}_nb{k}_r{round}__{attack}.pt     attack = inverter | tsinverse
+```
+
+(the recording's own name plus `__inverter` or `__tsinverse`). Shape `[n, 4, 96]` at levels 1–2 (row i =
+house i's 4 windows, in any order) and `[4n, 96]` at level 3 (every window rebuilt from the aggregate, in any
+order). Scoring pairs them with the true windows itself (Hungarian matching). Loaded with
+`weights_only=True`.
 
 ### Seed convention
 
 Houses depend only on (n, k). run_seed sets the model init, per-round dates and noise. The same run_seed is used
 at every level.
+
+## Evaluation
+
+```bash
+python data_real.py prepare        # once: data/raw/ -> data/processed/clean_2013.npz, then a summary
+python -m eval.score_all           # recordings/ + attack_outputs/ -> results/summary.md, summary.csv, per_house.csv, per_day.csv
+python -m eval.figures             # results/fig_attack_vs_houses_r{round}.png
+python -m eval.exposure            # results/exposure.csv, fig_exposure.png (level 3)
+python -m eval.forecast_table      # logs/*_test.json -> results/forecast.md, forecast.csv
+```
+
+`score_all` takes `--recordings`, `--attacks`, `--out` and `--blind weekday|same_date`.
+
+**Definitions** (`eval/metrics.py`, `eval/baseline.py`):
+
+- **Blind guess:** for each of the window's 2 days, the attacker pool's mean day for that weekday over its
+  train days (`--blind same_date`: the pool's mean on that exact date, a stronger baseline).
+- **sMAPE** in kWh, 0 to 200 %. Readings where both values are 0 count as a match.
+- **Matching:** one-to-one, minimising total sMAPE (Hungarian), within a house's 4 windows at levels 1–2 and
+  over all 4n windows at level 3. Caveat: because the matching sees the truth, an attacker that outputs many
+  varied windows gets a small selection advantage (a noisy blind guess scores slightly below blind on sMAPE in
+  `tests/test_eval.py`).
+- **Routine timing:** morning rise = the largest jump between 04:00 and 12:00; evening peak = the highest
+  reading between 16:00 and midnight; both on a 3-reading moving average. Error in hours, mean of the 2 days.
+- **Home or away:** a day is "away" if mean use 09:00–17:00 is below 1.3 × the median 01:00–05:00 use.
+  Accuracy per house, plus pooled balanced accuracy (away days are rarer).
+- **Protection holds:** per score, the attack's improvement over the blind guess, paired per house over all
+  houses and neighbourhoods, is at most 2 standard errors. `protection_holds` = this holds for sMAPE, rise
+  error, peak error and home/away.
+- **Per-house exposure (level 3):** Spearman correlation of attack success (blind sMAPE − attack sMAPE) with
+  the house's share of the neighbourhood's use and with its RMSE distance from the blind guess.
+- **Forecast cost:** test MAE and RMSE in kWh from each run's `_test.json`, mean ± SE over k.
 
 ## Future work
 
