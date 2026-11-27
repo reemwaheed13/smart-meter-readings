@@ -6,7 +6,9 @@ Simulation tests run real Flower simulations on the data.py in the repo (current
 from __future__ import annotations
 
 import csv
+import json
 import math
+import shutil
 
 import numpy as np
 import pytest
@@ -20,8 +22,10 @@ from train.app import ClippingRangeExceeded
 from train.costs import running_cost
 from train.noise_share_mod import NoiseShareMod, noise_seed
 from train.recorder import recording_path, rounds_to_record
+from train import run as train_run
 from train.run import is_complete, run, run_resumable
-from train.settings import resolve
+from train.settings import (MAX_EXPECTED_CUTS, ClippingRangeTooSmall, check_clipping_range,
+                            expected_clipping_cuts, min_clipping_range, resolve)
 
 N, K, LR, C, CR = 5, 0, 0.1, 1.0, 8.0
 DELTA = common.load_config()["dp"]["delta"]
@@ -287,4 +291,72 @@ def test_resume(l3_none, tmp_path):
     recording_path(copy, 2).write_bytes(b"not a recording")
     assert not is_complete(copy)
     recording_path(copy, 2).unlink()
+    assert not is_complete(copy)
+
+
+# --------------------------------------------------------------------------- pre-run clipping_range check
+
+def test_expected_clipping_cuts_formula():
+    # n*T*P*2*Phi(-cr/(sigma/sqrt n)); 2*Phi(-x) = erfc(x/sqrt 2). Hand check at x = 2: 2*Phi(-2) = 0.0455003.
+    sigma, n = 2.0 * math.sqrt(5), 5            # share std = 2.0
+    assert expected_clipping_cuts(n, 10, P, 4.0, sigma) == pytest.approx(5 * 10 * P * 0.0455003, rel=1e-5)
+    assert expected_clipping_cuts(n, 10, P, 4.0, 0.0) == 0.0 and expected_clipping_cuts(n, 10, P, 4.0, None) == 0.0
+    # The Colab failure: C = 1, eps = 1, n = 5, T = 10, clipping_range 8.0 is 3.69 share stds:
+    # 2*Phi(-3.6923) = 2.222e-4, times n*T*P = 520800 -> about 116 cuts expected.
+    s1 = common.sigma_for(1, 1.0, DELTA)
+    assert expected_clipping_cuts(5, 10, P, 8.0, s1) == pytest.approx(115.73, rel=1e-3)
+    assert expected_clipping_cuts(5, 10, P, 16.0, s1) < 1e-6           # 7.38 stds: about 8e-8
+
+
+def test_min_clipping_range_is_smallest_passing():
+    s1 = common.sigma_for(1, 1.0, DELTA)
+    for n, T in [(5, 10), (5, 200), (20, 50)]:
+        cr = min_clipping_range(n, T, P, s1)
+        assert expected_clipping_cuts(n, T, P, cr, s1) < MAX_EXPECTED_CUTS
+        assert expected_clipping_cuts(n, T, P, cr - 0.01, s1) >= MAX_EXPECTED_CUTS
+        assert cr == round(cr, 2)
+
+
+def test_check_refuses_small_clipping_range(null_config):
+    s = resolve(3, 1, 5, K, lr=LR, T=10, C=1.0, clipping_range=8.0, config_path=null_config)
+    want_min = min_clipping_range(5, 10, P, s.sigma)
+    with pytest.raises(ClippingRangeTooSmall) as e:
+        check_clipping_range(s)
+    msg = str(e.value)
+    assert f"{expected_clipping_cuts(5, 10, P, 8.0, s.sigma):.4g}" in msg and f"{want_min:g}" in msg
+    check_clipping_range(resolve(3, 1, 5, K, lr=LR, T=10, C=1.0, clipping_range=16.0, config_path=null_config))
+    # eps = none and levels 1-2 skip the check, however small clipping_range is
+    check_clipping_range(resolve(3, "none", 5, K, lr=LR, T=10, C=1.0, clipping_range=1e-4, config_path=null_config))
+    check_clipping_range(resolve(2, 1, 5, K, lr=LR, T=10, C=1.0, config_path=null_config))
+    check_clipping_range(resolve(1, "none", 5, K, lr=LR, T=10, config_path=null_config))
+
+
+def test_refused_run_starts_nothing_and_deletes_nothing(null_config, tmp_path, capsys):
+    s = resolve(3, 1, 5, K, lr=LR, T=10, C=1.0, clipping_range=8.0, out_dir=tmp_path, config_path=null_config)
+    s.logs_dir.mkdir(parents=True)
+    partial = s.logs_dir / f"{s.run_name}.csv"
+    partial.write_text("round\n")
+    with pytest.raises(ClippingRangeTooSmall):
+        run_resumable(s)
+    with pytest.raises(ClippingRangeTooSmall):
+        run(s)
+    assert partial.exists() and not s.recordings_dir.exists()
+    rc = train_run.main(["--level", "3", "--eps", "1", "--n", "5", "--k", str(K), "--out", str(tmp_path),
+                         "--lr", str(LR), "--T", "10", "--C", "1.0", "--clipping-range", "8.0"])
+    assert rc == 2 and "smallest clipping_range" in capsys.readouterr().err
+
+
+def test_clipping_range_logged_and_changed_value_redoes_run(l3_none, l2, tmp_path):
+    t = json.load(open(l3_none.logs_dir / f"{l3_none.run_name}_test.json"))
+    assert t["clipping_range"] == CR
+    assert json.load(open(l2.logs_dir / f"{l2.run_name}_test.json"))["clipping_range"] is None
+    copy = type(l3_none)(**{**l3_none.__dict__, "recordings_dir": tmp_path / "recordings", "logs_dir": tmp_path / "logs"})
+    shutil.copytree(l3_none.recordings_dir, copy.recordings_dir)
+    shutil.copytree(l3_none.logs_dir, copy.logs_dir)
+    assert is_complete(copy)
+    other = type(copy)(**{**copy.__dict__, "clipping_range": 2 * CR})
+    assert not is_complete(other)                          # logged 8.0, current 16.0: redo
+    p = copy.logs_dir / f"{copy.run_name}_test.json"
+    del t["clipping_range"]
+    p.write_text(json.dumps(t))                            # an older log without the key
     assert not is_complete(copy)

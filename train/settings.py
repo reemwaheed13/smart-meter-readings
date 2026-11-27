@@ -6,6 +6,7 @@ still null. A needed value that is null with no override is an error: the run re
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,58 @@ import data
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 IMPLEMENTED_LEVELS = (1, 2, 3)
+
+# Pre-run clipping_range check (level 3 with noise): refuse a run whose expected number of values
+# beyond the SecAgg+ clipping_range, over the whole run, is above this.
+MAX_EXPECTED_CUTS = 0.01
+
+
+class ClippingRangeTooSmall(ValueError):
+    """The SecAgg+ clipping_range is too close to the noise shares: the run is refused before it starts."""
+
+
+def expected_clipping_cuts(n: int, T: int, P: int, clipping_range: float, sigma: float | None) -> float:
+    """Expected number of values with |x| > clipping_range over a whole level-3 run:
+
+        n * T * P * 2 * Phi(-clipping_range / (sigma / sqrt(n)))
+
+    Each of the n*T*P protected values carries noise N(0, (sigma/sqrt(n))^2). The update itself
+    (clipped to L2 norm C) is ignored. sigma None or 0 (eps = none) gives 0. 2*Phi(-x) = erfc(x/sqrt 2).
+    """
+    if not sigma:
+        return 0.0
+    share = sigma / math.sqrt(n)
+    return n * T * P * math.erfc(clipping_range / (share * math.sqrt(2.0)))
+
+
+def min_clipping_range(n: int, T: int, P: int, sigma: float, max_cuts: float = MAX_EXPECTED_CUTS) -> float:
+    """The smallest clipping_range (rounded up to 0.01) whose expected cut count is below max_cuts."""
+    lo, hi = 0.0, 1.0
+    while expected_clipping_cuts(n, T, P, hi, sigma) >= max_cuts:
+        hi *= 2
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        lo, hi = (lo, mid) if expected_clipping_cuts(n, T, P, mid, sigma) < max_cuts else (mid, hi)
+    cr = math.ceil(hi * 100) / 100
+    while expected_clipping_cuts(n, T, P, cr, sigma) >= max_cuts:   # guard against rounding
+        cr += 0.01
+    return round(cr, 2)
+
+
+def check_clipping_range(s: "RunSettings") -> None:
+    """Refuse a level-3 run with noise whose expected clipping_range cuts exceed MAX_EXPECTED_CUTS.
+    Levels 1-2 and eps = none skip the check."""
+    if s.level != 3 or not s.sigma:
+        return
+    P = common.num_params(common.Model())
+    exp_cuts = expected_clipping_cuts(s.n, s.T, P, s.clipping_range, s.sigma)
+    if exp_cuts > MAX_EXPECTED_CUTS:
+        raise ClippingRangeTooSmall(
+            f"[{s.run_name}] clipping_range {s.clipping_range:g} is too small for the noise shares "
+            f"(sigma/sqrt(n) = {s.sigma / math.sqrt(s.n):.4g}): expected {exp_cuts:.4g} values beyond it over "
+            f"the run (n*T*P*2*Phi(-clipping_range/(sigma/sqrt(n))), n={s.n}, T={s.T}, P={P}), above "
+            f"{MAX_EXPECTED_CUTS}. The smallest clipping_range that brings it under {MAX_EXPECTED_CUTS} is "
+            f"{min_clipping_range(s.n, s.T, P, s.sigma):g}. Refusing to start.")
 
 
 @dataclass(frozen=True)

@@ -5,13 +5,18 @@ Launches a Flower simulation (flwr.simulation.run_simulation, Ray backend) with 
 config.yaml is null.
 
 --out DIR puts recordings/ and logs/ under DIR. Runs are resumable: a run whose recordings and
-logs all exist in DIR and pass load_recording is skipped. A partial run (some of its files exist)
+logs all exist in DIR, pass load_recording and logged the same clipping_range is skipped. A partial run (some of its files exist)
 is deleted and rerun from scratch.
+
+Level 3 with noise: before anything starts, the run refuses a clipping_range whose expected number
+of cuts over the run, n*T*P*2*Phi(-clipping_range/(sigma/sqrt(n))), is above 0.01, and names the
+smallest clipping_range that would pass (train.settings.check_clipping_range).
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import pickle
 import sys
 
@@ -20,7 +25,7 @@ from flwr.simulation import run_simulation
 from attacks.recording import load_recording
 from train.app import backend_config, make_client_app, make_server_app
 from train.recorder import recording_path, rounds_to_record
-from train.settings import RunSettings, resolve
+from train.settings import RunSettings, check_clipping_range, resolve
 
 
 def run_files(s: RunSettings) -> list:
@@ -31,7 +36,8 @@ def run_files(s: RunSettings) -> list:
 
 def is_complete(s: RunSettings) -> bool:
     """True if every file of the run exists, every recording passes load_recording and matches the
-    run, and the CSV has rounds 1..T."""
+    run, the CSV has rounds 1..T, and the clipping_range logged in the test JSON equals the run's
+    (None at levels 1-2; a JSON without the key counts as None, so an older level-3 run is redone)."""
     files = run_files(s)
     if not all(p.exists() for p in files):
         return False
@@ -42,12 +48,15 @@ def is_complete(s: RunSettings) -> bool:
                 return False
         with open(s.logs_dir / f"{s.run_name}.csv", newline="") as f:
             rounds = [int(row["round"]) for row in csv.DictReader(f)]
+        with open(s.logs_dir / f"{s.run_name}_test.json") as f:
+            logged_cr = json.load(f).get("clipping_range")
     except (ValueError, KeyError, OSError, RuntimeError, pickle.UnpicklingError, EOFError):
         return False
-    return rounds == list(range(1, s.T + 1))
+    return rounds == list(range(1, s.T + 1)) and logged_cr == s.clipping_range
 
 
 def run(s: RunSettings) -> None:
+    check_clipping_range(s)   # before anything starts: refuses a clipping_range too close to the noise
     print(f"[{s.run_name}] houses={list(s.house_ids)} T={s.T} lr={s.lr} C={s.C} sigma={s.sigma} "
           f"run_seed={s.run_seed}", flush=True)
     run_simulation(
@@ -61,7 +70,9 @@ def run(s: RunSettings) -> None:
 
 
 def run_resumable(s: RunSettings) -> bool:
-    """Skip a complete run (returns False); otherwise delete any partial files and run (returns True)."""
+    """Skip a complete run (returns False); otherwise delete any partial files and run (returns True).
+    The pre-run clipping_range check comes first, so a refused run deletes nothing."""
+    check_clipping_range(s)
     if is_complete(s):
         print(f"[{s.run_name}] complete in {s.logs_dir.parent}, skipping", flush=True)
         return False
@@ -92,7 +103,8 @@ def main(argv=None) -> int:
     try:
         s = resolve(a.level, a.eps, a.n, a.k, lr=a.lr, T=a.T, C=a.C, clipping_range=a.clipping_range,
                     out_dir=a.out)
-    except (ValueError, NotImplementedError) as e:
+        check_clipping_range(s)
+    except (ValueError, NotImplementedError) as e:   # includes ClippingRangeTooSmall
         print(f"error: {e}", file=sys.stderr)
         return 2
     run_resumable(s)

@@ -111,7 +111,8 @@ class RoundRunner:
         if r == self.s.T:
             test = self.strategy.test_error_kwh()
             with open(self.s.logs_dir / f"{self.s.run_name}_test.json", "w") as f:
-                json.dump({"round": r, **test, "env": machine_info()}, f, indent=2)
+                json.dump({"round": r, **test, "clipping_range": self.s.clipping_range, "env": machine_info()},
+                          f, indent=2)
             print(f"[{self.s.run_name}] test MAE={test['test_mae_kwh']:.4f} kWh "
                   f"RMSE={test['test_rmse_kwh']:.4f} kWh", flush=True)
 

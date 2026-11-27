@@ -42,7 +42,12 @@ calibration:
     10: null
     20: null
   C: null                        # L2 clipping norm for levels 2 and 3
-  clipping_range: null           # SecAgg+ clipping range
+  # SecAgg+ clipping range. It must cover the NOISE at the smallest n (5) and eps = 1, not just the
+  # update size: each house's noise share has std sigma/sqrt(n) (about 2.17 at C = 1, n = 5, eps = 1).
+  # The pre-run check (train.settings.check_clipping_range) enforces this: a level-3 run refuses to
+  # start if n*T*P*2*Phi(-clipping_range/(sigma/sqrt(n))) > 0.01. Doubling clipping_range doubles
+  # the quantisation step (2*clipping_range/2**22).
+  clipping_range: null
 
 dp:
   delta: 1.0e-5

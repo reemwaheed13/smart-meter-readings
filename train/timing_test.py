@@ -1,6 +1,6 @@
 """Timing test: 50 rounds of level 3 (SecAgg+ + noise_share_mod), n = 20, eps = 1, into --out.
 
-    python -m train.timing_test --out DIR --T 120 [--lr 0.1 --C 1.0 --clipping-range 8.0]
+    python -m train.timing_test --out DIR --T 120 [--lr 0.1 --C 1.0 --clipping-range 16.0]
 
 Writes DIR/timing.json with the median round_time_s over rounds 2..50 (round 1 is the Ray
 warm-up), the mean bytes_per_house, the machine info, and
@@ -22,7 +22,7 @@ from pathlib import Path
 from train.costs import running_cost
 from train.env import machine_info
 from train.run import run, run_files
-from train.settings import resolve
+from train.settings import check_clipping_range, resolve
 
 LEVEL, EPS, N, K, ROUNDS, RUNS = 3, 1, 20, 0, 50, 27
 
@@ -41,6 +41,7 @@ def main(argv=None) -> int:
     try:
         s = resolve(LEVEL, EPS, N, K, lr=a.lr, C=a.C, clipping_range=a.clipping_range,
                     out_dir=out, rounds=a.rounds)
+        check_clipping_range(s)
     except (ValueError, NotImplementedError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -49,7 +50,7 @@ def main(argv=None) -> int:
     run(s)
     cost = running_cost(s.logs_dir / f"{s.run_name}.csv")
     result = {
-        "level": LEVEL, "eps": EPS, "n": N, "nb": K, "rounds": s.T,
+        "level": LEVEL, "eps": EPS, "n": N, "nb": K, "rounds": s.T, "clipping_range": s.clipping_range,
         "median_round_time_s": cost["median_round_time_s"],
         "median_over_rounds": [cost["rounds"][0], cost["rounds"][-1]],
         "bytes_per_house": cost["bytes_per_house"],
