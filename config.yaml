@@ -53,11 +53,12 @@ dp:
     8: null
 
 secaggplus:
-  # Odd on purpose. flwr 1.45.0's SecAggPlusWorkflow.setup_stage bumps an even num_shares (!= n) to
-  # num_shares+1 for the neighbour ring AFTER it has sent the even value to the clients, which then
-  # crash (IndexError in secaggplus_mod._share_keys). 5 is what Flower itself would use for 4.
+  # num_shares = 5, not 4: flwr 1.45.0 bumps even share counts to odd, and 4 crashes the clients.
+  # (SecAggPlusWorkflow.setup_stage turns an even num_shares != n into num_shares+1 for the neighbour
+  # ring AFTER it has sent the even value to the clients, which then crash with an IndexError in
+  # secaggplus_mod._share_keys. 5 is what Flower itself would use for 4.)
   num_shares: 5
-  reconstruction_threshold: 3
+  reconstruction_threshold: 3    # unchanged
   clipping_range: null           # taken from calibration.clipping_range
   # Quantisation and modulus are left at the Flower defaults (flwr==1.45.0,
   # flwr.server.workflow.SecAggPlusWorkflow):

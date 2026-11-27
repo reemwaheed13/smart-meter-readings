@@ -261,10 +261,11 @@ the aggregate step is the same FedSGD step as level 1, `w -= lr · mean(ĝ)`.
 
 **Level 3: Flower's SecAgg+ plus our `noise_share_mod`.**
 - Server: `inner = SecAggPlusWorkflow(num_shares=5, reconstruction_threshold=3, clipping_range=...)`, with
-  quantisation and modulus at Flower's defaults (2²² and 2³²). `num_shares` is 5 rather than 4 because
-  flwr 1.45.0's `setup_stage` turns an even `num_shares` (≠ n) into `num_shares + 1` for the neighbour ring
-  *after* it has sent the even value to the clients, and the clients then crash with an IndexError in
-  `_share_keys`. 5 is what Flower itself would use for 4.
+  quantisation and modulus at Flower's defaults (2²² and 2³²). **`num_shares` = 5, not 4: flwr 1.45.0 bumps even
+  share counts to odd, and 4 crashes the clients.** Its `setup_stage` turns an even `num_shares` (≠ n) into
+  `num_shares + 1` for the neighbour ring *after* it has sent the even value to the clients, which then crash
+  with an IndexError in `_share_keys`. 5 is what Flower itself would use for 4. `reconstruction_threshold`
+  stays 3.
 - Client: `mods=[secaggplus_mod, NoiseShareMod(C, sigma, n, run_seed, clipping_range)]`
   (`train/noise_share_mod.py`). The first mod is the outermost, so `noise_share_mod` sees the client's plaintext
   gradient. It clips it to C and adds the noise share N(0, (σ/√n)²) via `common.protect(update, 3, ...)`, seeded
@@ -277,7 +278,9 @@ the aggregate step is the same FedSGD step as level 1, `w -= lr · mean(ĝ)`.
   would be about 1000× coarser.)
 - `FedSGD.aggregate_fit` gets results whose parameters all hold the same unmasked, de-quantised vector. Flower
   divides it by the total weight, so with equal weights it is the **mean** of the n protected updates, not their
-  sum (read from the 1.45.0 source and confirmed by `test_level3_view_times_n_is_sum_of_clipped_updates`). That
+  sum (read from the 1.45.0 source and confirmed by `test_level3_view_times_n_is_sum_of_clipped_updates`: with
+  n = 5, eps = none, clipping_range 8.0, the max per-coordinate |server_view·n − sum of clipped true updates| was
+  1.39e-05, against a quantisation step of 2·8.0/2²² = 3.81e-06 and the test's bound n·step = 1.91e-05). That
   vector is the `[P]` `server_view`, recorded with `view_is_sum = False`. **Attacks multiply it by n** to get the
   sum. The aggregate step is `w -= lr · server_view`.
 - `MeteredGrid` counts the bytes of all four SecAgg+ stages.
