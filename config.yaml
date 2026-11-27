@@ -19,6 +19,9 @@ data:
     test: 0.20
   drop_boundary_windows: true    # drop windows whose readings cross a split boundary
   attacker_pool_size: 500        # houses held by the attacker, disjoint from the neighbourhoods
+  raw_dir: data/raw              # Kaggle informations_households.csv + halfhourly_dataset/ (gitignored)
+  processed_file: data/processed/clean_2013.npz   # written by `python data_real.py prepare` (gitignored);
+                                 # env SMART_METER_PROCESSED overrides it (e.g. the copy on Drive in Colab)
   scaling:
     method: minmax               # scale to 0-1
     fit_on: attacker_pool        # min/max are fitted on the attacker pool only
