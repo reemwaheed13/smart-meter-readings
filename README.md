@@ -254,25 +254,27 @@ recorded weights, so the matched quantity is exactly the training gradient:
 | 3 | `server_view` = mean of the n protected updates | `mean_h clip(local_update(fake_h), C)`, 4n fake windows |
 
 At level 3 the attack optimises against the **mean**, which keeps the gradient term on the paper's single-gradient
-scale. `server_view · n` (the sum) is stored in the metrics JSON, with an L1 sum check for the reconstruction and for
+scale. The diagnostics JSON holds an L1 check against `server_view · n` (the sum) for the reconstruction and for
 the true windows. Loss: Σ|fake − observed| + λ_P·periodicity(48) + λ_T·trend + λ_Q^obs·bounds(inputs) +
 λ_Q^tar·bounds(targets), with λ_P = λ_T = 0.5 (the paper's London best) and bounds weights 1 / 0.1 (their code). The
 bounds come from the quantile inversion model, which is **on everywhere, including the grid**. It is trained per
 recording on 4096 attacker-pool samples at the recorded weights (`attacks/aux_gradients.py`: 4 windows of one
-attacker house on 4 random train dates, clipped at levels 2–3, the mean of n such houses at level 3, no noise).
+attacker house on 4 random train dates, clipped at levels 2–3, the mean of n such houses at level 3, no noise). The
+dates are drawn from those valid for every house in the sample. It reads only through `data.py`, on the train split.
 `--no-inversion-model` exists only so the tests run fast.
 
-**Scoring** (`attacks/scoring.py`): Hungarian matching (scipy) of reconstructed to true windows by minimum total
-mean-absolute error, within each house at levels 1–2 and across all 4n windows at level 3, then per-house metrics:
-sMAPE of the input and target halves on the 0–1 scale (the paper's metric, comparable with its London numbers) and
-MAE/RMSE in kWh. The **blind guess** is the attacker pool's mean window on each of the round's 4 dates (the server
-knows the dates), matched the same way.
+**Outputs and scoring.** `python -m attacks.ts_inverse --recording PATH ... --out attack_outputs` writes, per
+recording, `attack_outputs/<recording name>__tsinverse.pt` = `{"rebuilt": tensor}` in the format of "Attack output
+format" below (0–1, `[n, 4, 96]` at levels 1–2, `[4n, 96]` at level 3). Next to it, `<recording name>__tsinverse.json`
+holds diagnostics only: initial and final gradient loss and steps per inversion, the seeds, the level-3
+`server_view · n` check and the inversion-model log. It holds no scores. Resume parts go in `attack_outputs/_work/`.
+The grid is scored **only** by `python -m eval.score_all --blind same_date` (Shifa's matching, sMAPE, blind guess
+and tables; see "Evaluation").
 
 **Seeds and resume.** Every random draw (fake-window init, restarts, aux samples, inversion-model init and shuffling)
 is seeded from (`common.run_seed(n, nb)`, round, house, restart), so reruns give identical output. A recording whose
-`DIR/<stem>/metrics.json` holds the same settings is skipped. After an interruption, finished houses and the trained
-inversion model are reused. Outputs per recording: `metrics.json`, `recon.pt`, `inversion_model.pt` and the per-house
-parts.
+`__tsinverse.pt` exists and whose `__tsinverse.json` holds the same settings is skipped. After an interruption,
+finished houses and the trained inversion model are reused.
 
 **Batch-1 reproduction gate.** `python -m attacks.reproduce_ts_inverse --out DIR` replicates their London FCN
 setting. The attacked state, read from their code, is the **untrained** FCN right after `set_seed(seed)` with PyTorch's
@@ -282,7 +284,9 @@ seeds 10, 43, 28, 80, 71. It reports input and target sMAPE (mean ± std over th
 6.3e-06 / 2.5e-06, in three rows: `table2_config` (their Table II attack, which their results notebook takes from
 `ts-inverse_batch1_without_target_reconst_12-6-2024`: no inversion model and no regularisers), `ts_inverse_b1` (our
 configured TS-Inverse, 1 window) and `ours_level1_b4` (**our setting**: level 1, 4 windows). It refuses the FAKE
-`data.py`.
+`data.py`. Its sMAPE is on the **paper scale (0–1), reproduction only**: a fraction on the 0–1 values, input and target
+halves apart, as in Table II. It is not the grid's score. Its matching (`eval.metrics.match_windows`) and blind guess
+(`eval.baseline.blind_guess`, `same_date`) come from `eval/`, and MAE/RMSE are in kWh.
 
 ### TS-Inverse: what is ported and what changed
 
@@ -311,8 +315,8 @@ Changes from their code:
    has no restarts).
 7. **Seeding:** our seeded generators per draw instead of their global `set_seed`. Their dropout-mask options (TCN
    only) and one-shot targets (batch 1 only) are not ported.
-8. **Scoring:** Hungarian matching for evaluation (they used a greedy match with an identity fallback), MAE/RMSE in
-   kWh, and the per-date attacker-pool blind guess.
+8. **Scoring:** done by `eval.score_all` (Hungarian matching on sMAPE; they used a greedy match with an identity
+   fallback), with the `same_date` attacker-pool blind guess. The paper-scale sMAPE is kept only in the reproduction.
 9. **Reproduction data:** our London `data.py` (2013, standard tariff, min-max fitted on the attacker pool), one
    house chosen by `--house` (default: the first house of neighbourhood n = 5, k = 0), and the window drawn by a
    generator seeded with the seed. They used the first of 30 consumers in the Monash London file, min-max per series

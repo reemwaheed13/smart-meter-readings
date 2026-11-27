@@ -27,6 +27,12 @@ What their London FCN run attacks (read from their code, src/ts_inverse/workers/
     steps, ReduceLROnPlateau (0.1, patience steps // 10), sign of the input gradient, clamp to [0, 1]
     every 2nd step, U(0, 1) init, NO inversion model (num_learn_epochs 0) and all regulariser weights 0.
 
+Metric: sMAPE on the PAPER SCALE (0-1), REPRODUCTION ONLY: mean of 2|a-b| / (|a|+|b|) on the 0-1 scaled
+values, 0/0 counted as 0, separately for the input half and the target half, as TS-Inverse reports it
+(paper_smape below). This is not the grid's score: eval/metrics.py's sMAPE is in % on kWh and the grid
+is scored only by eval.score_all. Matching (4-window row) and the blind guess (--blind same_date) come
+from eval/metrics.py and eval/baseline.py; MAE / RMSE are in kWh (data.unscale).
+
 Rows reported (sMAPE mean +- std over the 5 seeds, std with ddof 1, next to Table II's 6.3e-06 / 2.5e-06):
   table2_config      1 window, their Table II configuration (above)
   ts_inverse_b1      1 window, our configured TS-Inverse (inversion model, lambda_P = lambda_T = 0.5,
@@ -51,11 +57,14 @@ import sys
 import zlib
 from pathlib import Path
 
+import numpy as np
 import torch
 
 import common
 import data
-from attacks import aux_gradients, scoring, ts_inverse
+from attacks import aux_gradients, ts_inverse
+from eval.baseline import blind_guess
+from eval.metrics import match_windows
 
 ROWS = {
     "table2_config": {"windows": 1, "inversion_model": False,
@@ -68,11 +77,32 @@ ROWS = {
                        "label": "OUR SETTING: level 1, 4 windows (one FedSGD step)"},
 }
 METRICS = ["smape_input", "smape_target", "mae_kwh", "rmse_kwh"]
+SMAPE_SCALE = "paper scale (0-1), reproduction only"
+BLIND = "same_date"
 LR = 1.0   # local_update returns the gradient; lr is not applied, so its value does not matter here
 
 
 def _seed(seed: int, row: str, tag: str) -> int:
     return zlib.crc32(f"reproduce|{seed}|{row}|{tag}".encode())
+
+
+def paper_smape(a, b) -> float:
+    """sMAPE on the PAPER SCALE (0-1), REPRODUCTION ONLY: mean(2|a-b| / (|a|+|b|)) on 0-1 scaled values,
+    0/0 counted as 0, a fraction in [0, 2] (Makridakis 1993; the definition TS-Inverse reports in
+    Table II). Written here, not ported. The grid uses eval.metrics.smape (in %, on kWh) via eval.score_all."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    num, den = 2 * np.abs(a - b), np.abs(a) + np.abs(b)
+    return float(np.divide(num, den, out=np.zeros_like(num), where=den > 0).mean())
+
+
+def window_metrics(true, guess) -> dict:
+    """true, guess: [K, 96] on the 0-1 scale, already paired row by row."""
+    L = common.INPUT_LEN
+    true, guess = np.asarray(true, float), np.asarray(guess, float)
+    err = data.unscale(true) - data.unscale(guess)
+    return {"smape_input": paper_smape(true[:, :L], guess[:, :L]),
+            "smape_target": paper_smape(true[:, L:], guess[:, L:]),
+            "mae_kwh": float(np.abs(err).mean()), "rmse_kwh": float(np.sqrt((err ** 2).mean()))}
 
 
 def attacked_state(seed: int) -> torch.nn.Module:
@@ -101,10 +131,12 @@ def run_one(row: str, seed: int, house: str, settings: dict, use_inv: bool) -> d
         inv, inv_log = ts_inverse.train_inversion_model(grads, wins, settings, _seed(seed, row, "inversion_model"))
         q = ts_inverse.predict_quantiles(inv, target)
     res = ts_inverse.invert(model, target, 1, None, LR, 1, W, settings, _seed(seed, row, "init"), q)
-    sc = scoring.score(true.unsqueeze(0), res["recon"], aux_gradients.attacker_pool_mean(dates), [house], True)
+    t = true.numpy()
+    recon = match_windows(res["recon"][0].numpy(), t)               # the attacker does not know the order
+    blind = match_windows(blind_guess(dates, BLIND), t)
     return {"row": row, "seed": seed, "house": house, "dates": dates, "steps": res["steps"],
             "grad_loss": res["grad_loss"], "trace": res["trace"], "inversion_model": inv_log,
-            "attack": sc["mean"]["attack"], "blind": sc["mean"]["blind"], "recon": res["recon"][0].tolist(),
+            "attack": window_metrics(t, recon), "blind": window_metrics(t, blind), "recon": recon.tolist(),
             "true": true.tolist()}
 
 
@@ -169,12 +201,13 @@ def main(argv=None) -> int:
                         "steps": parts[0]["steps"],
                         "attack": {k: _mean_std([pt["attack"][k] for pt in parts]) for k in METRICS},
                         "blind": {k: _mean_std([pt["blind"][k] for pt in parts]) for k in METRICS}}
-    summary = {"house": house, "paper_table2_fcn_london_b1": cfg["paper_fcn_london_b1"], "rows": results,
+    summary = {"house": house, "paper_table2_fcn_london_b1": cfg["paper_fcn_london_b1"],
+               "smape_scale": SMAPE_SCALE, "blind": BLIND, "rows": results,
                "data_is_fake": bool(getattr(data, "FAKE", False))}
     (out / "reproduction.json").write_text(json.dumps(summary, indent=1))
 
     ref = cfg["paper_fcn_london_b1"]
-    print(f"\nTS-Inverse reproduction, house {house}, seeds {seeds}  (sMAPE on 0-1 data, mean +- std)")
+    print(f"\nTS-Inverse reproduction, house {house}, seeds {seeds}  (sMAPE: {SMAPE_SCALE}; mean +- std)")
     print(f"{'row':16s} {'input sMAPE':>24s} {'target sMAPE':>24s} {'MAE kWh':>10s} {'blind MAE':>10s}")
     print(f"{'paper Table II':16s} {ref['input_smape']:>24.2g} {ref['target_smape']:>24.2g}")
     for row, r in results.items():

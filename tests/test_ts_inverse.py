@@ -1,10 +1,10 @@
-"""TS-Inverse port (attacks/ts_inverse.py), aux gradients, scoring and the reproduction script.
+"""TS-Inverse port (attacks/ts_inverse.py), aux gradients, its output format and the reproduction script.
 
 Fake data only (the data.py stub). No real attack is run: step counts and aux sizes are tiny.
+Scoring, matching and the blind guess are Shifa's (eval/); these tests only use them.
 """
 from __future__ import annotations
 
-import itertools
 import json
 
 import numpy as np
@@ -13,8 +13,10 @@ import torch
 
 import common
 import data
-from attacks import aux_gradients, reproduce_ts_inverse, scoring, ts_inverse
+from attacks import aux_gradients, reproduce_ts_inverse, ts_inverse
 from attacks.recording import load_recording
+from eval import score_all
+from eval.score_all import load_attack_output, score_one
 from train.env import machine_info
 
 LR = 0.1
@@ -91,9 +93,8 @@ def test_level1_loss_falls_and_beats_blind_guess():
     means = [c.mean() for c in chunks]
     assert all(a > b for a, b in zip(means, means[1:])), means        # falls steadily
     assert trace[-1, 1] < 0.2 * trace[0, 1]
-    blind = aux_gradients.attacker_pool_mean(rec["dates"])
-    sc = scoring.score(rec["true_windows"], res["recon"], blind, rec["house_ids"], per_house_matching=True)
-    a, b = sc["mean"]["attack"]["mae_kwh"], sc["mean"]["blind"]["mae_kwh"]
+    rows, _ = score_one(rec, res["recon"], ts_inverse.ATTACK, blind_mode="same_date")   # the grid's scoring
+    a, b = rows[0]["smape_attack"], rows[0]["smape_blind"]
     assert a < b, (a, b)
 
 
@@ -141,37 +142,24 @@ def test_level3_sum_check_uses_times_n():
     assert not torch.allclose(rec_sum["server_view"] * n, true_sum, rtol=1e-2)
 
 
-# --------------------------------------------------------------------------- Hungarian matching
+# --------------------------------------------------------------------------- output shapes as eval.score_all reads them
 
-def test_hungarian_matches_brute_force():
-    g = torch.Generator().manual_seed(0)
-    for _ in range(5):
-        true, recon = torch.rand(5, 96, generator=g), torch.rand(5, 96, generator=g)
-        perm = scoring.match(true, recon)
-        cost = (true[:, None] - recon[None]).abs().mean(-1)
-        best = min(sum(float(cost[i, p[i]]) for i in range(5)) for p in itertools.permutations(range(5)))
-        assert sum(float(cost[i, perm[i]]) for i in range(5)) == pytest.approx(best)
-
-
-def test_hungarian_recovers_permutation_across_houses():
+def test_level3_flat_output_is_matched_across_houses():
     n = 3
     rec = make_recording(3, n)
     flat = rec["true_windows"].reshape(n * W, -1)
-    shuffled_idx = torch.randperm(n * W, generator=torch.Generator().manual_seed(1))
-    recon = flat[shuffled_idx]
-    perm = scoring.match(flat, recon)
-    assert torch.equal(recon[perm], flat)
-    sc = scoring.score(rec["true_windows"], recon, aux_gradients.attacker_pool_mean(rec["dates"]),
-                       rec["house_ids"], per_house_matching=False)
-    assert all(h["attack"]["mae_kwh"] == pytest.approx(0.0, abs=1e-9) for h in sc["per_house"])
-    assert all(h["blind"]["mae_kwh"] > 0 for h in sc["per_house"])
+    rebuilt = flat[torch.randperm(n * W, generator=torch.Generator().manual_seed(1))]     # [4n, 96], shuffled
+    rows, _ = score_one(rec, rebuilt, ts_inverse.ATTACK, blind_mode="same_date")
+    assert all(r["smape_attack"] == pytest.approx(0.0, abs=1e-6) for r in rows)
+    assert all(r["smape_blind"] > 0 for r in rows)
 
 
-def test_smape_matches_their_definition():
-    a = torch.tensor([0.0, 1.0, 0.5, 0.0])
-    b = torch.tensor([0.0, 0.5, 0.5, 0.2])
-    # 0/0 -> 0;  2*0.5/1.5;  0;  2*0.2/0.2 = 2
-    assert scoring.smape(a, b) == pytest.approx((0 + 2 / 3 + 0 + 2) / 4)
+def test_paper_smape_is_their_definition():
+    a = np.array([0.0, 1.0, 0.5, 0.0])
+    b = np.array([0.0, 0.5, 0.5, 0.2])
+    # 0/0 -> 0;  2*0.5/1.5;  0;  2*0.2/0.2 = 2   (a fraction on the 0-1 scale, not %)
+    assert reproduce_ts_inverse.paper_smape(a, b) == pytest.approx((0 + 2 / 3 + 0 + 2) / 4)
+    assert reproduce_ts_inverse.SMAPE_SCALE == "paper scale (0-1), reproduction only"
 
 
 # --------------------------------------------------------------------------- regularisers and inversion model
@@ -221,42 +209,62 @@ def test_inversion_model_trains_and_predicts():
 
 def test_cli_level1_writes_outputs_and_resumes(tmp_path, capsys):
     rec, p = make_recording(1, 2, tmp_path)
-    out = tmp_path / "out"
-    assert ts_inverse.main(["--recording", str(p), "--out", str(out), "--no-inversion-model", "--steps", "10"]) == 0
-    d = out / p.stem
-    met = json.loads((d / "metrics.json").read_text())
-    assert met["level"] == 1 and len(met["scores"]["per_house"]) == 2 and met["inversion_model"] is None
-    assert met["paper_reference"]["table2_fcn_london_b1"]["input_smape"] == 6.3e-06
-    r = torch.load(d / "recon.pt", weights_only=True)
-    assert r["recon"].shape == (2, W, 96)
+    out = tmp_path / "attack_outputs"
+    args = ["--recording", str(p), "--out", str(out), "--no-inversion-model", "--steps", "10"]
+    assert ts_inverse.main(args) == 0
+    pt, js = out / f"{p.stem}__tsinverse.pt", out / f"{p.stem}__tsinverse.json"
+    rebuilt = load_attack_output(pt)                                    # weights_only=True
+    assert set(torch.load(pt, weights_only=True)) == {"rebuilt"}
+    assert rebuilt.shape == (2, W, 96) and 0 <= float(rebuilt.min()) and float(rebuilt.max()) <= 1
+    diag = json.loads(js.read_text())
+    assert diag["level"] == 1 and len(diag["inversions"]) == 2 and diag["inversion_model"] is None
+    assert diag["rebuilt_shape"] == [2, W, 96] and diag["seeds"]["run_seed"] == common.run_seed(2, 0)
+    assert all(x["steps"] == 10 and x["grad_loss_final"] >= 0 for x in diag["inversions"])
+    assert set(diag) == {"recording", "attack", "level", "eps", "n", "nb", "round", "rebuilt_shape", "seeds",
+                         "fingerprint", "inversion_model", "inversions"}           # diagnostics only, no scores
     capsys.readouterr()
-    assert ts_inverse.main(["--recording", str(p), "--out", str(out), "--no-inversion-model", "--steps", "10"]) == 0
+    assert ts_inverse.main(args) == 0
     assert "skipping" in capsys.readouterr().out
-    assert json.loads((d / "metrics.json").read_text()) == met
+    assert json.loads(js.read_text()) == diag
     # Other settings: redone, and the house parts are not reused.
-    assert ts_inverse.main(["--recording", str(p), "--out", str(out), "--no-inversion-model", "--steps", "11"]) == 0
-    assert json.loads((d / "metrics.json").read_text())["attack"][0]["steps"] == 11
+    assert ts_inverse.main(args[:-1] + ["11"]) == 0
+    assert json.loads(js.read_text())["inversions"][0]["steps"] == 11
 
 
 def test_cli_level3_with_inversion_model(tmp_path):
     n = 2
     rec, p = make_recording(3, n, tmp_path)
-    out = tmp_path / "out"
+    out = tmp_path / "attack_outputs"
     args = ["--recording", str(p), "--out", str(out), "--steps", "6", "--aux-samples", "12", "--epochs", "1"]
     assert ts_inverse.main(args) == 0
-    d = out / p.stem
-    met = json.loads((d / "metrics.json").read_text())
-    assert met["inversion_model"]["samples"] == 12
-    sv_n = torch.tensor(met["level3"]["server_view_times_n"])
-    assert torch.allclose(sv_n, rec["server_view"] * n)
-    chk = met["level3"]["sum_check"]
+    pt, js = out / f"{p.stem}__tsinverse.pt", out / f"{p.stem}__tsinverse.json"
+    diag = json.loads(js.read_text())
+    assert diag["inversion_model"]["samples"] == 12
+    chk = diag["server_view_times_n_check"]
+    assert chk["view_is_sum"] is False
+    assert chk["server_view_times_n_l1_norm"] == pytest.approx(float((rec["server_view"] * n).abs().sum()), rel=1e-5)
     assert chk["true_windows_l1"] < 1e-5 * chk["server_view_times_n_l1_norm"]
-    assert len(met["scores"]["matching"]) == n * W
-    assert torch.load(d / "recon.pt", weights_only=True)["recon"].shape == (n * W, 96)
-    first = (d / "metrics.json").read_text()
-    (d / "metrics.json").unlink()               # interrupted after the attack: parts are reused
+    assert load_attack_output(pt).shape == (n * W, 96)
+    first = load_attack_output(pt)
+    js.unlink()                                 # interrupted after the attack: parts are reused
     assert ts_inverse.main(args) == 0
-    assert json.loads((d / "metrics.json").read_text())["scores"] == json.loads(first)["scores"]
+    assert torch.equal(load_attack_output(pt), first)
+
+
+def test_cli_outputs_go_through_score_all(tmp_path, monkeypatch):
+    recs = tmp_path / "recordings"
+    recs.mkdir()
+    paths = [make_recording(1, 2, recs)[1], make_recording(3, 2, recs)[1]]
+    out = tmp_path / "attack_outputs"
+    assert ts_inverse.main(["--recording", *map(str, paths), "--out", str(out), "--no-inversion-model",
+                            "--steps", "4"]) == 0
+    res = tmp_path / "results"
+    monkeypatch.setattr("sys.argv", ["score_all", "--recordings", str(recs), "--attacks", str(out),
+                                     "--out", str(res), "--blind", "same_date"])
+    score_all.main()
+    per_house = __import__("pandas").read_csv(res / "per_house.csv")
+    assert set(per_house["attack"]) == {"tsinverse"} and sorted(set(per_house["level"])) == [1, 3]
+    assert len(per_house) == 4 and (res / "summary.md").exists()
 
 
 # --------------------------------------------------------------------------- reproduction script

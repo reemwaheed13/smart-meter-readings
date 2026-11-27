@@ -1,4 +1,4 @@
-"""Attacker-pool data for the attacks: auxiliary gradients and the blind-guess baseline.
+"""Attacker-pool auxiliary gradients for the attacks.
 
 Shared by TS-Inverse's inversion model (attacks/ts_inverse.py) and the learned inverter.
 
@@ -11,8 +11,12 @@ An aux sample mirrors one thing the server sees in a round, computed with the sa
   level 3:  mean over n attacker houses of clip(g_h, C)        (the [P] server_view is a mean too)
 
 Each sample's windows are one or n attacker houses on the same windows_per_house random train dates
-(all houses in a round share the round's dates). The noise is not added: a sample is the clean,
-clipped view. Every draw comes from a torch.Generator seeded by the caller, so reruns are identical.
+(all houses in a round share the round's dates), drawn from the dates valid for all of that sample's
+houses. The noise is not added: a sample is the clean, clipped view. Every draw comes from a
+torch.Generator seeded by the caller, so reruns are identical.
+
+Data access is through data.py only (attacker_houses, valid_dates and get_windows), always on the train
+split. The blind guess lives in eval/baseline.py.
 """
 from __future__ import annotations
 
@@ -38,9 +42,12 @@ def house_view(model: torch.nn.Module, windows: torch.Tensor, level: int, C: flo
     return g if level == 1 else common.clip(g, C)
 
 
+SPLIT = "train"
+MAX_DRAWS = 100   # attempts per sample to find houses sharing enough valid train dates
+
+
 def aux_samples(global_model: dict, level: int, C: float | None, n: int, lr: float, num_samples: int,
-                seed: int, *, windows_per_house: int | None = None, split: str = "train"
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                seed: int, *, windows_per_house: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """num_samples attacker-pool samples at the recorded weights.
 
     Returns (grads [S, P], windows [S, H*W, 96]) with H = n houses per sample at level 3 and H = 1
@@ -57,15 +64,19 @@ def aux_samples(global_model: dict, level: int, C: float | None, n: int, lr: flo
     pool = data.attacker_houses()
     if H > len(pool):
         raise ValueError(f"need {H} attacker houses per sample, the pool has {len(pool)}")
-    dates = data.valid_dates(pool, split)
-    if W > len(dates):
-        raise ValueError(f"need {W} dates, the {split} split has {len(dates)}")
 
     g = torch.Generator().manual_seed(int(seed))
-    draws = []                                   # per sample: (house indices [H], date indices [W])
+    draws = []                                   # per sample: (house indices [H], dates [W])
     for _ in range(num_samples):
-        hs = torch.randperm(len(pool), generator=g)[:H].tolist()
-        ds = sorted(torch.randperm(len(dates), generator=g)[:W].tolist())
+        for _attempt in range(MAX_DRAWS):
+            hs = torch.randperm(len(pool), generator=g)[:H].tolist()
+            # Real data has gaps: only dates with a complete window for every drawn house qualify.
+            dates = data.valid_dates([pool[h] for h in hs], SPLIT)
+            if len(dates) >= W:
+                break
+        else:
+            raise ValueError(f"no {H} attacker houses with {W} shared valid {SPLIT} dates in {MAX_DRAWS} draws")
+        ds = [dates[i] for i in sorted(torch.randperm(len(dates), generator=g)[:W].tolist())]
         draws.append((hs, ds))
 
     # Fetch each house's windows once, for every date it is drawn with.
@@ -76,7 +87,7 @@ def aux_samples(global_model: dict, level: int, C: float | None, n: int, lr: flo
     cache = {}
     for h, ds in need.items():
         ds = sorted(ds)
-        win = data.get_windows([pool[h]], [dates[d] for d in ds], split)[0]   # [len(ds), 96]
+        win = data.get_windows([pool[h]], ds, SPLIT)[0]                 # [len(ds), 96]
         cache.update({(h, d): win[j] for j, d in enumerate(ds)})
 
     model = _model(global_model)
@@ -91,8 +102,3 @@ def aux_samples(global_model: dict, level: int, C: float | None, n: int, lr: flo
         grads[s] = torch.stack(views).mean(0)
     return grads, windows
 
-
-def attacker_pool_mean(dates: list[str], split: str = "train") -> torch.Tensor:
-    """The blind guess: the attacker pool's mean window on each of the given dates, [len(dates), 96].
-    The server knows the round's dates (it sends them in the fit config)."""
-    return data.get_windows(data.attacker_houses(), list(dates), split).mean(0)

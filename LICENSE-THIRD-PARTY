@@ -23,9 +23,10 @@ with this attribution:
 
 The changes made to their code are listed in README.md, "TS-Inverse: what is ported and what changed".
 
-No other file contains code from TS-Inverse. In particular attacks/aux_gradients.py and
-attacks/scoring.py are this project's own code (scoring.smape is the standard sMAPE, written
-independently with the same 0/0 = 0 convention). None of the project's own modules (common.py,
-data.py, train/, attacks/recording.py, attacks/aux_gradients.py, attacks/scoring.py) import the
-CC BY-SA files above; only tests/test_ts_inverse.py and notebooks/attack_ts_inverse.ipynb call them.
+No other file contains code from TS-Inverse. In particular attacks/aux_gradients.py and eval/ are
+this project's own code. paper_smape in attacks/reproduce_ts_inverse.py is the standard sMAPE
+(written independently, with the same 0/0 = 0 convention, not ported). None of the project's own
+modules (common.py, data.py, data_real.py, data_fake.py, train/, eval/, attacks/recording.py,
+attacks/aux_gradients.py) import the CC BY-SA files above; only tests/test_ts_inverse.py and
+notebooks/attack_ts_inverse.ipynb call them.
 The repository as a whole has no licence file yet.

@@ -9,7 +9,7 @@
 # inversion model (residual blocks) and its pinball-loss training. Changes are listed in README.md
 # ("TS-Inverse: what is ported and what changed"). This file is licensed under CC BY-SA 4.0
 # (https://creativecommons.org/licenses/by-sa/4.0/); see LICENSE-THIRD-PARTY.
-"""TS-Inverse against one recording: python -m attacks.ts_inverse --recording PATH [PATH ...] --out DIR
+"""TS-Inverse against one recording: python -m attacks.ts_inverse --recording PATH [PATH ...] --out attack_outputs
 
 Levels 1-2: the server sees one update per house (level 2: the gradient-space row g_hat converted back
 from LocalDpMod). Each house's update is inverted into its 4 windows by optimising 4 fake windows so
@@ -34,11 +34,15 @@ inversion model, trained per recording on attacker-pool gradients at the recorde
 
 Every random draw (fake-window init, restarts, aux samples, inversion-model init and shuffling) is
 seeded from the recording's run_seed (common.run_seed(n, nb)) and round, so reruns give identical
-output. Resumable: a recording whose metrics.json exists with the same settings is skipped, and
+output. Resumable: a recording whose outputs exist with the same settings is skipped, and
 finished houses / the trained inversion model are reused after an interruption.
 
-Outputs, per recording, in DIR/<recording stem>/: metrics.json, recon.pt (the reconstructions),
-inversion_model.pt, and the per-house parts.
+Outputs, per recording, in DIR (README, "Attack output format"):
+    DIR/<recording stem>__tsinverse.pt     {"rebuilt": tensor}, scaled 0-1: [n, 4, 96] at levels 1-2,
+                                           [4n, 96] at level 3 (any order). Scored by eval.score_all.
+    DIR/<recording stem>__tsinverse.json   diagnostics only (gradient loss, steps, seeds, the level-3
+                                           server_view * n check, inversion-model log). No scores.
+    DIR/_work/<recording stem>/            resume parts (per house / level 3, the inversion model)
 """
 from __future__ import annotations
 
@@ -53,10 +57,11 @@ import torch
 import torch.nn as nn
 
 import common
-from attacks import aux_gradients, scoring
+from attacks import aux_gradients
 from attacks.recording import load_recording
 
-VERSION = "ts_inverse-1"
+VERSION = "ts_inverse-2"
+ATTACK = "tsinverse"      # the attack name in the output file name (eval.score_all)
 L_IN, L_OUT = common.INPUT_LEN, common.OUTPUT_LEN
 
 
@@ -341,21 +346,27 @@ def _save(obj, path: Path) -> None:
     tmp.replace(path)
 
 
+def output_paths(recording: str | Path, out: str | Path) -> tuple[Path, Path, Path]:
+    """(rebuilt .pt, diagnostics .json, resume directory) for one recording."""
+    stem, out = Path(recording).stem, Path(out)
+    return out / f"{stem}__{ATTACK}.pt", out / f"{stem}__{ATTACK}.json", out / "_work" / stem
+
+
 def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inversion: bool = True) -> dict:
-    """Attack one recording and write DIR/<stem>/{metrics.json, recon.pt, ...}. Skips a recording whose
-    metrics.json already holds the same settings. Returns the metrics."""
+    """Attack one recording; write DIR/<stem>__tsinverse.pt ({"rebuilt"}) and DIR/<stem>__tsinverse.json
+    (diagnostics). Skips a recording whose outputs already exist with the same settings. Returns the
+    diagnostics."""
     path = Path(path)
     rec = load_recording(path)
-    d = Path(out) / path.stem
+    ppath, dpath, d = output_paths(path, out)
     d.mkdir(parents=True, exist_ok=True)
     fp = fingerprint(settings, use_inversion)
     fp_json = json.dumps(fp, sort_keys=True)
-    mpath = d / "metrics.json"
-    if mpath.exists():
+    if dpath.exists() and ppath.exists():
         try:
-            done = json.loads(mpath.read_text())
+            done = json.loads(dpath.read_text())
             if done.get("fingerprint") == json.loads(fp_json):
-                print(f"[{path.stem}] complete in {d}, skipping", flush=True)
+                print(f"[{path.stem}] complete in {out}, skipping", flush=True)
                 return done
         except (ValueError, OSError):
             pass
@@ -365,6 +376,7 @@ def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inve
     rs = common.run_seed(n, rec["nb"])
     model = _model(rec)
     C_match = None if level == 1 else C
+    seeds = {"run_seed": rs, "round": rnd}
 
     # Inversion model: one per recording (all houses share the recorded weights).
     inv, inv_log = None, None
@@ -372,11 +384,13 @@ def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inve
         ip = d / "inversion_model.pt"
         part = _load_part(ip, json.loads(fp_json))
         S = int(settings["aux_samples"])
+        seeds["aux"] = attack_seed(rs, rnd, -1, 0, "aux")
+        seeds["inversion_model"] = attack_seed(rs, rnd, -1, 0, "inversion_model")
         if part is None:
             print(f"[{path.stem}] aux samples ({S}) and inversion model", flush=True)
-            grads, wins = aux_gradients.aux_samples(rec["global_model"], level, C, n, lr, S,
-                                                    attack_seed(rs, rnd, -1, 0, "aux"), windows_per_house=W)
-            inv, inv_log = train_inversion_model(grads, wins, settings, attack_seed(rs, rnd, -1, 0, "inversion_model"))
+            grads, wins = aux_gradients.aux_samples(rec["global_model"], level, C, n, lr, S, seeds["aux"],
+                                                    windows_per_house=W)
+            inv, inv_log = train_inversion_model(grads, wins, settings, seeds["inversion_model"])
             _save({"fingerprint": fp_json, "state": inv.state_dict(), "log": json.dumps(inv_log)}, ip)
         else:
             cfg = settings["inversion_model"]
@@ -385,82 +399,76 @@ def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inve
             inv.eval()
             inv_log = json.loads(part["log"])
 
+    def _summary(house, part):
+        trace = json.loads(part["trace"])
+        return {"house": house, "grad_loss_start": trace[0][1] if trace else None,
+                "grad_loss_final": float(part["grad_loss"]), "steps": int(part["steps"]),
+                "restart": int(part["restart"]), "init_seed": int(part["init_seed"])}
+
     if level in (1, 2):
-        recon, attacks = torch.empty(n, W, rec["true_windows"].shape[2]), []
+        rebuilt, attacks = torch.empty(n, W, rec["true_windows"].shape[2]), []
         for h in range(n):
             hp = d / f"house_{h}.pt"
             part = _load_part(hp, json.loads(fp_json))
             if part is None:
                 target = rec["server_view"][h]
                 q = predict_quantiles(inv, target) if inv is not None else None
-                res = invert(model, target, level, C_match, lr, 1, W, settings, attack_seed(rs, rnd, h, 0, "init"), q)
+                init_seed = attack_seed(rs, rnd, h, 0, "init")
+                res = invert(model, target, level, C_match, lr, 1, W, settings, init_seed, q)
                 part = {"fingerprint": fp_json, "recon": res["recon"][0], "grad_loss": res["grad_loss"],
-                        "trace": json.dumps(res["trace"]), "steps": res["steps"]}
+                        "trace": json.dumps(res["trace"]), "steps": res["steps"], "restart": res["restart"],
+                        "init_seed": init_seed}
                 _save(part, hp)
                 print(f"[{path.stem}] house {h + 1}/{n}: grad loss {res['grad_loss']:.4g}", flush=True)
-            recon[h] = part["recon"]
-            attacks.append({"house": h, "grad_loss": float(part["grad_loss"]), "steps": int(part["steps"]),
-                            "trace": json.loads(part["trace"])})
-        view_target = None
+            rebuilt[h] = part["recon"]
+            attacks.append(_summary(h, part))
     else:
         mean_view, sum_view = level3_views(rec)
         hp = d / "level3.pt"
         part = _load_part(hp, json.loads(fp_json))
         if part is None:
             q = predict_quantiles(inv, mean_view) if inv is not None else None
-            res = invert(model, mean_view, 3, C, lr, n, W, settings, attack_seed(rs, rnd, -1, 0, "init"), q)
+            init_seed = attack_seed(rs, rnd, -1, 0, "init")
+            res = invert(model, mean_view, 3, C, lr, n, W, settings, init_seed, q)
             part = {"fingerprint": fp_json, "recon": res["recon"].reshape(n * W, -1), "grad_loss": res["grad_loss"],
-                    "trace": json.dumps(res["trace"]), "steps": res["steps"]}
+                    "trace": json.dumps(res["trace"]), "steps": res["steps"], "restart": res["restart"],
+                    "init_seed": init_seed}
             _save(part, hp)
             print(f"[{path.stem}] level 3: grad loss {res['grad_loss']:.4g}", flush=True)
-        recon = part["recon"]
-        attacks = [{"house": None, "grad_loss": float(part["grad_loss"]), "steps": int(part["steps"]),
-                    "trace": json.loads(part["trace"])}]
-        view_target = (mean_view, sum_view)
+        rebuilt = part["recon"]
+        attacks = [_summary(None, part)]
 
-    blind = aux_gradients.attacker_pool_mean(rec["dates"])
-    scores = scoring.score(rec["true_windows"], recon, blind, rec["house_ids"], per_house_matching=level in (1, 2))
-    metrics = {
-        "recording": path.name, "level": level, "eps": rec["eps"], "n": n, "nb": rec["nb"], "round": rnd,
-        "run_seed": rs, "house_ids": rec["house_ids"], "dates": rec["dates"],
+    diagnostics = {
+        "recording": path.name, "attack": ATTACK, "level": level, "eps": rec["eps"], "n": n, "nb": rec["nb"],
+        "round": rnd, "rebuilt_shape": list(rebuilt.shape), "seeds": seeds,
         "fingerprint": json.loads(fp_json),
         "inversion_model": inv_log,
-        "attack": attacks,
-        "scores": scores,
+        "inversions": attacks,
     }
     if level == 3:
-        mean_view, sum_view = view_target
-        fake_sum = fake_view(model, recon.view(n, W, -1), 3, C, lr).detach() * n
+        fake_sum = fake_view(model, rebuilt.view(n, W, -1), 3, C, lr).detach() * n
         true_sum = fake_view(model, rec["true_windows"], 3, C, lr).detach() * n
-        metrics["level3"] = {
+        diagnostics["server_view_times_n_check"] = {   # L1 distances to server_view * n
             "view_is_sum": rec["view_is_sum"],
-            "server_view_times_n": sum_view.tolist(),
-            "sum_check": {   # L1 distances to server_view * n (true: noise + quantisation only)
-                "reconstruction_l1": float((fake_sum - sum_view).abs().sum()),
-                "true_windows_l1": float((true_sum - sum_view).abs().sum()),
-                "server_view_times_n_l1_norm": float(sum_view.abs().sum()),
-            },
+            "server_view_times_n_l1_norm": float(sum_view.abs().sum()),
+            "rebuilt_l1": float((fake_sum - sum_view).abs().sum()),
+            "true_windows_l1": float((true_sum - sum_view).abs().sum()),   # noise + quantisation only
         }
-    if level == 1:
-        ref = common.load_config()["attacks"]["reproduce"]["paper_fcn_london_b1"]
-        metrics["paper_reference"] = {"table2_fcn_london_b1": ref,
-                                      "note": "paper: 1 window per attack; here: 4 windows (one FedSGD step)"}
-    _save({"recon": recon, "true_windows": rec["true_windows"], "matching": json.dumps(scores["matching"])},
-          d / "recon.pt")
-    tmp = mpath.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(metrics, indent=1))
-    tmp.replace(mpath)
-    m = scores["mean"]
-    print(f"[{path.stem}] MAE {m['attack']['mae_kwh']:.4f} kWh (blind {m['blind']['mae_kwh']:.4f}), sMAPE in/tar "
-          f"{m['attack']['smape_input']:.4g}/{m['attack']['smape_target']:.4g}", flush=True)
-    return metrics
+    _save({"rebuilt": rebuilt.contiguous()}, ppath)
+    tmp = dpath.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(diagnostics, indent=1))
+    tmp.replace(dpath)
+    worst = max(a["grad_loss_final"] for a in attacks)
+    print(f"[{path.stem}] wrote {ppath.name} {tuple(rebuilt.shape)}, max final grad loss {worst:.4g}", flush=True)
+    return diagnostics
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m attacks.ts_inverse", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--recording", nargs="+", required=True, help="recording file(s)")
-    p.add_argument("--out", required=True, help="output directory (one subdirectory per recording)")
+    p.add_argument("--out", default="attack_outputs",
+                   help="attack output directory (eval.score_all --attacks), default attack_outputs")
     p.add_argument("--no-inversion-model", action="store_true",
                    help="TESTS ONLY: skip the inversion model and its bounds term (not a grid option)")
     p.add_argument("--steps", type=int, default=None, help=argparse.SUPPRESS)          # tests only
