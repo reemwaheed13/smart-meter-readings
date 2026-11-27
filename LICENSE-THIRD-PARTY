@@ -1,0 +1,31 @@
+Third-party code in this repository
+====================================
+
+TS-Inverse
+----------
+
+Source:   https://github.com/Capsar/ts-inverse (read at its main branch, last pushed 2025-09-19)
+Authors:  Capsar (repository); paper: Meijer et al., "TS-Inverse: A Gradient Inversion Attack
+          Tailored for Federated Time Series Forecasting Models", IEEE SaTML 2025, arXiv:2503.20952.
+License:  Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+          https://creativecommons.org/licenses/by-sa/4.0/
+
+Files in this repository that contain code ported and adapted from it. These files, and only these,
+are licensed under CC BY-SA 4.0. Each one carries an SPDX-License-Identifier: CC-BY-SA-4.0 header
+with this attribution:
+
+  attacks/ts_inverse.py            the attack loop (L1 gradient matching, Adam, sign of the input
+                                   gradient, clamping, ReduceLROnPlateau), the periodicity, trend and
+                                   quantile-bounds regularisers, the quantile inversion model and its
+                                   pinball-loss training
+  attacks/reproduce_ts_inverse.py  their London FCN experiment protocol (seeds, attacked model state,
+                                   the Table II attack configuration), run with the port above
+
+The changes made to their code are listed in README.md, "TS-Inverse: what is ported and what changed".
+
+No other file contains code from TS-Inverse. In particular attacks/aux_gradients.py and
+attacks/scoring.py are this project's own code (scoring.smape is the standard sMAPE, written
+independently with the same 0/0 = 0 convention). None of the project's own modules (common.py,
+data.py, train/, attacks/recording.py, attacks/aux_gradients.py, attacks/scoring.py) import the
+CC BY-SA files above; only tests/test_ts_inverse.py and notebooks/attack_ts_inverse.ipynb call them.
+The repository as a whole has no licence file yet.

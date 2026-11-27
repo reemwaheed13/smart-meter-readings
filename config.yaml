@@ -94,3 +94,42 @@ seeds:
   # The houses depend only on (n, k). run_seed sets the model init, the per-round dates and
   # the DP noise. The same run_seed is used at every level.
   run_seed_formula: "1000*n + 10*k"
+
+attacks:
+  # TS-Inverse (Meijer et al. 2025), ported from github.com/Capsar/ts-inverse (CC BY-SA 4.0) in
+  # attacks/ts_inverse.py. Values are from their code (notebooks/05_* and src/ts_inverse/workers/*)
+  # unless marked. Fixed: there is no lambda tuning step.
+  ts_inverse:
+    gradient_loss: l1              # sum over parameters of |fake gradient - observed| (their "l1")
+    optimizer: adam
+    lr: 0.01                       # their optimization_learning_rate
+    # Steps per attack = base_steps * windows * step_multiplier, as in their code
+    # (base_num_attack_steps * batch_size * _attack_step_multiplier): 5000 for 1 window, 20000 for 4.
+    # "windows" is the number of fake windows optimised together (4 per house; 4n at level 3).
+    base_steps: 500
+    step_multiplier: 10
+    lr_decay_factor: 0.1           # ReduceLROnPlateau on the loss ("on_plateau_10")
+    lr_patience_divisor: 10        # patience = steps // 10
+    sign_input_grads: true         # their grad_signs_for_inputs (targets: false)
+    clamp_every: 2                 # their after_effect "clamp_2": clamp to [0, 1] every 2nd step
+    restarts: 1                    # their code has none; kept at 1 (lowest gradient loss wins if > 1)
+    periodicity_weight: 0.5        # lambda_P: the paper's London best (Table VI)
+    trend_weight: 0.5              # lambda_T: the paper's London best (Table VII)
+    bounds_weight_inputs: 1.0      # lambda_Q^obs: from their code (reg_combinations notebook)
+    bounds_weight_targets: 0.1     # lambda_Q^tar: from their code
+    inversion_model:               # gradient -> quantiles (their ImprovedGradToInputNN_Quantile)
+      enabled: true                # on everywhere, including the grid (--no-inversion-model is for tests only)
+      hidden: [768, 512]
+      dropout: 0.05
+      quantiles: [0.1, 0.3, 0.7, 0.9]
+      epochs: 75
+      batch_size: 32               # aux samples per training batch (their attack_batch_size)
+      lr: 0.001                    # AdamW
+      lr_decay_factor: 0.1         # ReduceLROnPlateau on the held-out aux loss
+      lr_patience_divisor: 10      # patience = epochs // 10
+      val_fraction: 0.1            # ours: held-out share of the aux samples (they used a separate split)
+    aux_samples: 4096              # ours: attacker-pool samples (attacks/aux_gradients.py)
+  reproduce:                       # attacks/reproduce_ts_inverse.py (batch-1 reproduction gate)
+    seeds: [10, 43, 28, 80, 71]    # their Table II seeds
+    # Table II, London Smartmeter, FCN, batch 1, TS-Inverse: sMAPE (mean over the 5 seeds).
+    paper_fcn_london_b1: {input_smape: 6.3e-06, target_smape: 2.5e-06}

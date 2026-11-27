@@ -98,12 +98,13 @@ data.py            data interface (currently a FAKE random stub, to be replaced 
 requirements.txt   exact pinned versions (flwr pinned: SecAgg+ APIs change between versions)
 data/              raw dataset files (gitignored, download locally)
 train/             Flower FedSGD: client, strategy, server/client apps, recorder, entry point (train.run)
-attacks/           learned inverter, TS-Inverse; recording.py loads and checks a recording
+attacks/           TS-Inverse (ts_inverse.py, reproduce_ts_inverse.py; CC BY-SA 4.0, see LICENSE-THIRD-PARTY),
+                   aux_gradients.py + scoring.py (shared with the learned inverter), recording.py
 eval/              metrics and plots
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
 logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
-notebooks/         colab_run.ipynb (the Stage 4 check in Colab; outputs on Google Drive)
+notebooks/         colab_run.ipynb (the Stage 4 check), attack_ts_inverse.ipynb (TS-Inverse); outputs on Google Drive
 ```
 
 ## Install and test
@@ -229,6 +230,91 @@ Every cell is safe to re-run. After a disconnect, just *Run all* again.
 
 Colab's torch is a different build from the pinned CPU one, so its version is recorded in every recording's
 `env`.
+
+## TS-Inverse
+
+`python -m attacks.ts_inverse --recording PATH [PATH ...] --out DIR` attacks recordings with TS-Inverse
+(Meijer et al. 2025), ported from [github.com/Capsar/ts-inverse](https://github.com/Capsar/ts-inverse). Settings are
+in config.yaml, `attacks.ts_inverse`, and are fixed: there is no λ tuning step. Run it in Colab through
+`notebooks/attack_ts_inverse.ipynb`, after the real `data.py` is in.
+
+**Licence.** `attacks/ts_inverse.py` and `attacks/reproduce_ts_inverse.py` contain ported code and are licensed
+under CC BY-SA 4.0, with attribution to Capsar/ts-inverse and Meijer et al. 2025 (see `LICENSE-THIRD-PARTY`). No
+other file contains their code, and none of our own modules import these two.
+
+**What it does.** The fake windows' update is computed with `common.local_update(..., create_graph=True)` at the
+recorded weights, so the matched quantity is exactly the training gradient:
+
+| Level | Server view | Matched against |
+|---|---|---|
+| 1 | `server_view[h]`, one row per house | `local_update(fake_h)`, 4 fake windows per house |
+| 2 | `server_view[h]` = ĝ_h (clip + noise) | `clip(local_update(fake_h), C)` |
+| 3 | `server_view` = mean of the n protected updates | `mean_h clip(local_update(fake_h), C)`, 4n fake windows |
+
+At level 3 the attack optimises against the **mean**, which keeps the gradient term on the paper's single-gradient
+scale. `server_view · n` (the sum) is stored in the metrics JSON, with an L1 sum check for the reconstruction and for
+the true windows. Loss: Σ|fake − observed| + λ_P·periodicity(48) + λ_T·trend + λ_Q^obs·bounds(inputs) +
+λ_Q^tar·bounds(targets), with λ_P = λ_T = 0.5 (the paper's London best) and bounds weights 1 / 0.1 (their code). The
+bounds come from the quantile inversion model, which is **on everywhere, including the grid**. It is trained per
+recording on 4096 attacker-pool samples at the recorded weights (`attacks/aux_gradients.py`: 4 windows of one
+attacker house on 4 random train dates, clipped at levels 2–3, the mean of n such houses at level 3, no noise).
+`--no-inversion-model` exists only so the tests run fast.
+
+**Scoring** (`attacks/scoring.py`): Hungarian matching (scipy) of reconstructed to true windows by minimum total
+mean-absolute error, within each house at levels 1–2 and across all 4n windows at level 3, then per-house metrics:
+sMAPE of the input and target halves on the 0–1 scale (the paper's metric, comparable with its London numbers) and
+MAE/RMSE in kWh. The **blind guess** is the attacker pool's mean window on each of the round's 4 dates (the server
+knows the dates), matched the same way.
+
+**Seeds and resume.** Every random draw (fake-window init, restarts, aux samples, inversion-model init and shuffling)
+is seeded from (`common.run_seed(n, nb)`, round, house, restart), so reruns give identical output. A recording whose
+`DIR/<stem>/metrics.json` holds the same settings is skipped. After an interruption, finished houses and the trained
+inversion model are reused. Outputs per recording: `metrics.json`, `recon.pt`, `inversion_model.pt` and the per-house
+parts.
+
+**Batch-1 reproduction gate.** `python -m attacks.reproduce_ts_inverse --out DIR` replicates their London FCN
+setting. The attacked state, read from their code, is the **untrained** FCN right after `set_seed(seed)` with PyTorch's
+default init. Nothing draws from torch's global RNG in between, so `torch.manual_seed(seed)` + `common.Model()` gives
+the same weights. It attacks the gradient of one training window (warm-up 0, 1 batch, `update_model` False), with
+seeds 10, 43, 28, 80, 71. It reports input and target sMAPE (mean ± std over the seeds) next to Table II's
+6.3e-06 / 2.5e-06, in three rows: `table2_config` (their Table II attack, which their results notebook takes from
+`ts-inverse_batch1_without_target_reconst_12-6-2024`: no inversion model and no regularisers), `ts_inverse_b1` (our
+configured TS-Inverse, 1 window) and `ours_level1_b4` (**our setting**: level 1, 4 windows). It refuses the FAKE
+`data.py`.
+
+### TS-Inverse: what is ported and what changed
+
+Ported (`attacks/ts_inverse.py`): their attack loop (`AttackTSInverseWorker.attack_batch`): L1 gradient loss, Adam at
+lr 0.01, sign of the input gradient, clamping to [0, 1] every 2nd step, `ReduceLROnPlateau(0.1, patience
+steps // 10)` on the total loss, U(0, 1) init and steps = 500 × windows × 10. Also their periodicity (period 48) and
+trend (detached least-squares line) regularisers, the quantile-bounds loss, `ImprovedGradToInputNN_Quantile` (two
+branches of residual blocks 768 → 512, dropout 0.05, quantiles 0.1/0.3/0.7/0.9) and its training (AdamW 1e-3, pinball
+loss, batches of 32, 75 + 1 epochs, `ReduceLROnPlateau` on the held-out loss).
+
+Changes from their code:
+
+1. **Model and data plumbing:** our `common.Model` (the same layers as their `FCN_Predictor`) and `common.local_update`
+   replace their model and loss call. The attack reads our recordings instead of their in-process training. Their
+   Flower path is unfinished (their README TODO), and none of it is used.
+2. **Levels 2–3:** the fake update is clipped to C inside the match. At level 3 the fake view is the mean over 4n
+   fake windows in n fake houses. Neither exists in their code, which attacks one unclipped gradient.
+3. **Aux data:** attacker-pool windows (`attacks/aux_gradients.py`, 4096 samples, fixed groups of 4 windows from one
+   house and 4 dates). They used the attacked series' own test/val splits, single-window gradients regrouped at
+   random into batches every epoch. The held-out set for the plateau scheduler is the last 10 % of the aux samples
+   (theirs was a separate split).
+4. **Quantile-bounds pairing:** they pair the bounds the other way round (upper = q_j). With ordered quantile
+   predictions that differs by a constant only, so the gradients match. We use the paper's form (Eq. 11).
+5. **λ values:** fixed at λ_P = λ_T = 0.5 and bounds 1 / 0.1. Their code sweeps λ_P, λ_T ∈ {2, 1, 0.5}.
+6. **Restarts:** 1, as in their code. If set above 1, the restart with the lowest gradient loss is kept (their code
+   has no restarts).
+7. **Seeding:** our seeded generators per draw instead of their global `set_seed`. Their dropout-mask options (TCN
+   only) and one-shot targets (batch 1 only) are not ported.
+8. **Scoring:** Hungarian matching for evaluation (they used a greedy match with an identity fallback), MAE/RMSE in
+   kWh, and the per-date attacker-pool blind guess.
+9. **Reproduction data:** our London `data.py` (2013, standard tariff, min-max fitted on the attacker pool), one
+   house chosen by `--house` (default: the first house of neighbourhood n = 5, k = 0), and the window drawn by a
+   generator seeded with the seed. They used the first of 30 consumers in the Monash London file, min-max per series
+   and split, and a shuffled loader draw.
 
 ## Flower wiring (flwr 1.45.0)
 
