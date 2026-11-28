@@ -56,7 +56,8 @@ SPLITS = ("train", "val", "test")
 
 # =========================================================================== one-time prep
 def _read_raw(raw_dir: Path, year: int, tariff: str):
-    """Long DataFrame LCLid, ts, kwh for the chosen tariff and year."""
+    """Yield one tidy DataFrame (LCLid, ts, kwh) per block file or CSV chunk, for the chosen tariff and
+    year. One piece at a time, so the whole dataset (~74 million readings) is never in memory at once."""
     import pandas as pd
 
     lo, hi = pd.Timestamp(f"{year}-01-01"), pd.Timestamp(f"{year + 1}-01-01")
@@ -72,7 +73,6 @@ def _read_raw(raw_dir: Path, year: int, tariff: str):
         return df
 
     blocks = sorted(glob.glob(str(raw_dir / "**" / "block_*.csv"), recursive=True))
-    frames = []
     if blocks:  # Kaggle layout
         info = pd.read_csv(raw_dir / "informations_households.csv", dtype=str)
         keep = set(info.loc[info["stdorToU"].str.strip() == tariff, "LCLid"].str.strip())
@@ -82,7 +82,7 @@ def _read_raw(raw_dir: Path, year: int, tariff: str):
             df.columns = [c.strip() for c in df.columns]
             energy = next(c for c in df.columns if c.lower().startswith("energy"))
             df = df.rename(columns={"tstp": "ts", energy: "kwh"})
-            frames.append(tidy(df[df["LCLid"].str.strip().isin(keep)]))
+            yield tidy(df[df["LCLid"].str.strip().isin(keep)])
             if i % 10 == 0:
                 print(f"  {i}/{len(blocks)} blocks")
     else:  # London Datastore single CSV
@@ -96,8 +96,7 @@ def _read_raw(raw_dir: Path, year: int, tariff: str):
                 kwh = next(c for c in ch.columns if "kwh" in c.lower())
                 ts = next(c for c in ch.columns if c.lower() in ("datetime", "tstp"))
                 ch = ch[ch["stdorToU"].str.strip() == tariff].rename(columns={ts: "ts", kwh: "kwh"})
-                frames.append(tidy(ch))
-    return pd.concat(frames, ignore_index=True)
+                yield tidy(ch)
 
 
 def _fill_short_gaps(x: np.ndarray, max_gap: int) -> np.ndarray:
@@ -119,24 +118,43 @@ def prepare(raw_dir: Path = RAW_DIR, out: Path = PROCESSED_FILE) -> None:
     year = _cfg["year"]
     start = pd.Timestamp(f"{year}-01-01")
     n_slots = (pd.Timestamp(f"{year + 1}-01-01") - start) // pd.Timedelta("30min")
-    df = _read_raw(Path(raw_dir), year, _cfg["tariff"])
-    df = df.groupby(["LCLid", "ts"], as_index=False)["kwh"].mean()  # duplicate timestamps
-    df["slot"] = ((df["ts"] - start) / pd.Timedelta("30min")).astype(int)
-
-    ids, rows, dropped = [], [], 0
-    for hid, g in df.groupby("LCLid"):
-        x = np.full(n_slots, np.nan, dtype=np.float32)
-        x[g["slot"].to_numpy()] = g["kwh"].to_numpy(dtype=np.float32)
-        x[x < 0] = np.nan
-        if np.isnan(x).mean() > _cfg["max_missing_fraction"]:
-            dropped += 1
+    # one float32 year per house, filled piece by piece (~70 KB per house)
+    series: dict[str, np.ndarray] = {}
+    for df in _read_raw(Path(raw_dir), year, _cfg["tariff"]):
+        if df.empty:
             continue
-        ids.append(hid)
-        rows.append(_fill_short_gaps(x, _cfg["max_fill_gap_readings"]))
+        df = df.groupby(["LCLid", "ts"], as_index=False)["kwh"].mean()  # duplicate timestamps
+        slots = ((df["ts"] - start) // pd.Timedelta("30min")).to_numpy(dtype=np.int64)
+        kwh = df["kwh"].to_numpy(dtype=np.float32)
+        for hid, idx in df.groupby("LCLid").indices.items():
+            x = series.get(hid)
+            if x is None:
+                x = series[hid] = np.full(n_slots, np.nan, dtype=np.float32)
+            x[slots[idx]] = kwh[idx]
+        del df, slots, kwh
+
+    max_missing = _cfg["max_missing_fraction"]
+    for x in series.values():
+        x[x < 0] = np.nan                                     # negative readings are errors
+    ids = sorted(h for h, x in series.items() if np.isnan(x).mean() <= max_missing)
+    dropped = len(series) - len(ids)
+    for hid in set(series) - set(ids):
+        del series[hid]
+
+    # stage the cleaned rows in a file on disk, popping each house as it is written, so memory never
+    # holds two copies of the data (the year for ~4,000 houses is ~300 MB)
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, house_ids=np.array(ids), readings=np.stack(rows), year=year)
-    print(f"kept {len(ids)} houses, dropped {dropped} with > {_cfg['max_missing_fraction']:.0%} missing")
+    tmp = out.with_name(out.stem + "_staging.npy")
+    readings = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32, shape=(len(ids), n_slots))
+    for i, hid in enumerate(ids):
+        readings[i] = _fill_short_gaps(series.pop(hid), _cfg["max_fill_gap_readings"])
+    readings.flush()
+    print("compressing and saving (a few minutes)...")
+    np.savez_compressed(out, house_ids=np.array(ids), readings=readings, year=year)
+    del readings
+    tmp.unlink()
+    print(f"kept {len(ids)} houses, dropped {dropped} with > {max_missing:.0%} missing")
     print(f"saved {out}")
     _store.cache_clear()
 
