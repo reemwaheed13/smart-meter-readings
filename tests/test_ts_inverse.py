@@ -177,16 +177,20 @@ def test_regularisers():
     assert float(ts_inverse.bounds(torch.full((3, 48), 0.95), q)) == pytest.approx(0.15)
 
 
-def test_aux_samples_shapes_clipping_and_seed():
+def test_aux_samples_shapes_clipping_noise_and_seed():
     rec = make_recording(3, 3)
-    g1, w1 = aux_gradients.aux_samples(rec["global_model"], 3, 1.0, 3, LR, 6, seed=5)
-    g2, w2 = aux_gradients.aux_samples(rec["global_model"], 3, 1.0, 3, LR, 6, seed=5)
+    sigma = 0.6
+    g1, w1 = aux_gradients.aux_samples(rec["global_model"], 3, 1.0, 3, LR, 6, seed=5, sigma=sigma)
+    g2, w2 = aux_gradients.aux_samples(rec["global_model"], 3, 1.0, 3, LR, 6, seed=5, sigma=sigma)
     assert g1.shape == (6, common.num_params(common.Model())) and w1.shape == (6, 3 * W, 96)
     assert torch.equal(g1, g2) and torch.equal(w1, w2)
     m = common.Model()
     m.load_state_dict(rec["global_model"])
-    want = torch.stack([common.clip(common.local_update(m, w1[0, h * W:(h + 1) * W], LR), 1.0) for h in range(3)]).mean(0)
-    assert torch.allclose(g1[0], want)
+    clean = torch.stack([common.clip(common.local_update(m, w1[0, h * W:(h + 1) * W], LR), 1.0) for h in range(3)]).mean(0)
+    # The samples are no longer the clean view: they carry the level-3 server view's noise, std sigma / n.
+    assert float((g1[0] - clean).std()) == pytest.approx(sigma / 3, rel=0.05)
+    g0, w0 = aux_gradients.aux_samples(rec["global_model"], 3, 1.0, 3, LR, 6, seed=5, sigma=0.0)
+    assert torch.equal(w0, w1) and torch.allclose(g0[0], clean)              # sigma 0: the clean view
     pool = set(data.attacker_houses())
     assert not pool & set(rec["house_ids"])
     g3, w3 = aux_gradients.aux_samples(rec["global_model"], 1, None, 3, LR, 4, seed=5, windows_per_house=1)

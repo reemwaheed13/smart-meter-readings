@@ -106,7 +106,7 @@ eval/              blind guess, scoring, result tables and figures (see "Evaluat
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
 logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
-notebooks/         colab_run.ipynb (the Stage 4 check), attack_ts_inverse.ipynb (TS-Inverse); outputs on Google Drive
+notebooks/         colab_run.ipynb (the Stage 4 check), attack_ts_inverse.ipynb (both attacks); outputs on Google Drive
 ```
 
 ## Install and test
@@ -258,10 +258,8 @@ scale. The diagnostics JSON holds an L1 check against `server_view · n` (the su
 the true windows. Loss: Σ|fake − observed| + λ_P·periodicity(48) + λ_T·trend + λ_Q^obs·bounds(inputs) +
 λ_Q^tar·bounds(targets), with λ_P = λ_T = 0.5 (the paper's London best) and bounds weights 1 / 0.1 (their code). The
 bounds come from the quantile inversion model, which is **on everywhere, including the grid**. It is trained per
-recording on 4096 attacker-pool samples at the recorded weights (`attacks/aux_gradients.py`: 4 windows of one
-attacker house on 4 random train dates, clipped at levels 2–3, the mean of n such houses at level 3, no noise). The
-dates are drawn from those valid for every house in the sample. It reads only through `data.py`, on the train split.
-`--no-inversion-model` exists only so the tests run fast.
+recording on 4096 attacker-pool samples at the recorded weights: the shared aux set (see "Aux set" below), with the
+level's noise. `--no-inversion-model` exists only so the tests run fast.
 
 **Outputs and scoring.** `python -m attacks.ts_inverse --recording PATH ... --out attack_outputs` writes, per
 recording, `attack_outputs/<recording name>__tsinverse.pt` = `{"rebuilt": tensor}` in the format of "Attack output
@@ -305,7 +303,7 @@ Changes from their code:
 2. **Levels 2–3:** the fake update is clipped to C inside the match. At level 3 the fake view is the mean over 4n
    fake windows in n fake houses. Neither exists in their code, which attacks one unclipped gradient.
 3. **Aux data:** attacker-pool windows (`attacks/aux_gradients.py`, 4096 samples, fixed groups of 4 windows from one
-   house and 4 dates). They used the attacked series' own test/val splits, single-window gradients regrouped at
+   house and 4 dates, n houses at level 3, with the level's clipping and noise). They used the attacked series' own test/val splits, single-window gradients regrouped at
    random into batches every epoch. The held-out set for the plateau scheduler is the last 10 % of the aux samples
    (theirs was a separate split).
 4. **Quantile-bounds pairing:** they pair the bounds the other way round (upper = q_j). With ordered quantile
@@ -321,6 +319,59 @@ Changes from their code:
    house chosen by `--house` (default: the first house of neighbourhood n = 5, k = 0), and the window drawn by a
    generator seeded with the seed. They used the first of 30 consumers in the Monash London file, min-max per series
    and split, and a shuffled loader draw.
+
+## Aux set (shared by both attacks)
+
+`attacks/aux_gradients.py` builds, per recording, 4096 attacker-pool samples (update, windows) at the recording's
+weights, with the public protection settings (level, C, sigma, n). The attacker pool is disjoint from every
+neighbourhood. With g = `common.local_update` of 4 windows of one attacker house on 4 random train dates:
+
+| Level | Sample (what the server would see) | Noise std per coordinate |
+|---|---|---|
+| 1 | g | 0 |
+| 2 | `common.protect(g, 2, C, σ, n)` = clip(g, C) + N(0, σ²) | σ |
+| 3 | mean over n attacker houses of `common.protect(g_h, 3, C, σ, n)` = mean_h [clip(g_h, C) + N(0, σ²/n)] | **σ / n** |
+
+Level 2 in training is Flower's `LocalDpMod` in weight space, which clips −lr·g to lr·C and adds
+N(0, (lr·C·√(2 ln(1.25/δ))/ε)²). The server's g_hat = (w − returned)/lr is therefore clip(g, C) + N(0, σ²) with σ =
+`sigma_for(eps, C, δ)`, the recording's sigma as long as `dp.sigma` in config.yaml stays null. Level 3: each house's
+share is N(0, σ²/n), the n shares sum to N(0, σ²), and the server's view is their **mean**, so its noise is σ/n. SecAgg+'s
+stochastic rounding (about 4e-6) is not modelled. The window draw and the noise use separate seeded streams, so
+changing σ changes only the noise. The dates are drawn from those valid for every house in the sample. It reads only
+through `data.py`, on the train split.
+
+The set is seeded from `aux_seed(run_seed(n, nb), round)` and cached on disk (`--aux-cache DIR`, default
+`OUT/_aux_cache`; in Colab `MyDrive/smart-meter-fl/attacks/aux_cache`). The key is the recording name, level, C, σ,
+n, aux size, seed, windows per house, lr and the aux version, so TS-Inverse and the learned inverter on one recording
+share one set, and changing σ (or anything else in the key) makes a new one. A set is about 0.17–0.3 GB (4096 ×
+10,416 float32 gradients plus the windows), about 34 GB for the 162-recording grid, so the Colab notebook runs both
+attacks per recording and deletes that recording's set once both have succeeded.
+
+## Learned inverter
+
+`python -m attacks.learned_inverter --recording PATH ... --out attack_outputs --aux-cache DIR` (our own code). A
+network is **retrained for every recording** at its weights on its aux set. Its input is the update [P]: one house's
+row at levels 1–2, `server_view` (the mean) at level 3. It outputs 4 windows at levels 1–2 and 4n at level 3, each
+[96] in 0–1, in any order.
+
+- **Prior:** each output slot starts from the attacker pool's same-date mean window for its date
+  (`eval.baseline.blind_guess(dates, "same_date")`; at level 3 the 4 date priors repeated for the n houses). The
+  network predicts a correction on top: out = clamp(prior + (2·sigmoid(z) − 1), 0, 1), with the head initialised to
+  zero. An **untrained inverter outputs exactly the blind guess**, so anything better is learned from the update.
+- **Network:** a residual MLP trunk (768, 512; Linear → BatchNorm → ReLU → dropout 0.05 → Linear → BatchNorm plus a
+  projected skip), the same architecture as TS-Inverse's inversion model, written independently. Then a linear head
+  to K × 96.
+- **Loss:** MSE after Hungarian matching of the outputs to the true windows inside each sample (the update does not
+  say which window is which; the matching is computed without gradient).
+- **Training:** AdamW 1e-3, batches of 32, 75 epochs, `ReduceLROnPlateau` (0.1, patience 7) on the held-out loss: the
+  same settings as TS-Inverse's inversion model. The last 10 % of the aux set is held out to pick the best epoch;
+  epoch 0 (the blind guess) is a candidate too. No other tuning. Settings: config.yaml `attacks.learned_inverter`.
+- **Seeds:** every draw (model init and dropout, shuffling) from (`run_seed(n, nb)`, round, house index −1 = the
+  recording, purpose); the aux set from `aux_seed`, the same as TS-Inverse's.
+- **Outputs:** `attack_outputs/<recording name>__inverter.pt` = `{"rebuilt": tensor}` ("Attack output format"), and
+  `<recording name>__inverter.json` with diagnostics only: train and held-out loss per epoch, best epoch, seeds and
+  the aux set used. No scores. Resumable: skipped if both exist with the same settings and aux key, redone otherwise.
+  Scored with TS-Inverse in one table by `python -m eval.score_all --blind same_date`.
 
 ## Flower wiring (flwr 1.45.0)
 

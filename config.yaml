@@ -132,6 +132,18 @@ attacks:
       lr_patience_divisor: 10      # patience = epochs // 10
       val_fraction: 0.1            # ours: held-out share of the aux samples (they used a separate split)
     aux_samples: 4096              # ours: attacker-pool samples (attacks/aux_gradients.py)
+  learned_inverter:                # attacks/learned_inverter.py (ours). Training settings = TS-Inverse's
+                                   # inversion model; no other tuning.
+    aux_samples: 4096              # the same aux set as TS-Inverse (attacks/aux_gradients.py, shared cache)
+    blind: same_date               # each output slot starts from eval.baseline's guess for its date
+    hidden: [768, 512]             # residual MLP trunk, ReLU, batch norm
+    dropout: 0.05
+    epochs: 75
+    batch_size: 32
+    lr: 0.001                      # AdamW
+    lr_decay_factor: 0.1           # ReduceLROnPlateau on the held-out loss
+    lr_patience_divisor: 10        # patience = epochs // 10
+    val_fraction: 0.1              # held-out share of the aux set; picks the best epoch
   reproduce:                       # attacks/reproduce_ts_inverse.py (batch-1 reproduction gate)
     seeds: [10, 43, 28, 80, 71]    # their Table II seeds
     # Table II, London Smartmeter, FCN, batch 1, TS-Inverse: sMAPE (mean over the 5 seeds).

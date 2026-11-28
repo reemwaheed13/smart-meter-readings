@@ -60,7 +60,7 @@ import common
 from attacks import aux_gradients
 from attacks.recording import load_recording
 
-VERSION = "ts_inverse-2"
+VERSION = "ts_inverse-3"   # 3: aux samples carry the level's noise (aux_gradients.VERSION aux-2)
 ATTACK = "tsinverse"      # the attack name in the output file name (eval.score_all)
 L_IN, L_OUT = common.INPUT_LEN, common.OUTPUT_LEN
 
@@ -352,11 +352,14 @@ def output_paths(recording: str | Path, out: str | Path) -> tuple[Path, Path, Pa
     return out / f"{stem}__{ATTACK}.pt", out / f"{stem}__{ATTACK}.json", out / "_work" / stem
 
 
-def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inversion: bool = True) -> dict:
+def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inversion: bool = True,
+                     aux_cache: str | Path | None = None) -> dict:
     """Attack one recording; write DIR/<stem>__tsinverse.pt ({"rebuilt"}) and DIR/<stem>__tsinverse.json
-    (diagnostics). Skips a recording whose outputs already exist with the same settings. Returns the
-    diagnostics."""
+    (diagnostics). Skips a recording whose outputs already exist with the same settings. The aux set
+    comes from aux_gradients.cached_aux_samples (shared with the learned inverter through aux_cache,
+    default DIR/_aux_cache). Returns the diagnostics."""
     path = Path(path)
+    aux_cache = Path(out) / "_aux_cache" if aux_cache is None else Path(aux_cache)
     rec = load_recording(path)
     ppath, dpath, d = output_paths(path, out)
     d.mkdir(parents=True, exist_ok=True)
@@ -384,12 +387,13 @@ def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inve
         ip = d / "inversion_model.pt"
         part = _load_part(ip, json.loads(fp_json))
         S = int(settings["aux_samples"])
-        seeds["aux"] = attack_seed(rs, rnd, -1, 0, "aux")
+        seeds["aux"] = aux_gradients.aux_seed(rs, rnd)
         seeds["inversion_model"] = attack_seed(rs, rnd, -1, 0, "inversion_model")
         if part is None:
             print(f"[{path.stem}] aux samples ({S}) and inversion model", flush=True)
-            grads, wins = aux_gradients.aux_samples(rec["global_model"], level, C, n, lr, S, seeds["aux"],
-                                                    windows_per_house=W)
+            grads, wins, _dates, aux_info = aux_gradients.cached_aux_samples(rec, path, S, aux_cache)
+            print(f"[{path.stem}] aux set {'loaded from' if aux_info['from_cache'] else 'saved to'} "
+                  f"{aux_info['path']}", flush=True)
             inv, inv_log = train_inversion_model(grads, wins, settings, seeds["inversion_model"])
             _save({"fingerprint": fp_json, "state": inv.state_dict(), "log": json.dumps(inv_log)}, ip)
         else:
@@ -469,6 +473,8 @@ def main(argv=None) -> int:
     p.add_argument("--recording", nargs="+", required=True, help="recording file(s)")
     p.add_argument("--out", default="attack_outputs",
                    help="attack output directory (eval.score_all --attacks), default attack_outputs")
+    p.add_argument("--aux-cache", default=None,
+                   help="aux-set cache directory, shared with attacks.learned_inverter (default OUT/_aux_cache)")
     p.add_argument("--no-inversion-model", action="store_true",
                    help="TESTS ONLY: skip the inversion model and its bounds term (not a grid option)")
     p.add_argument("--steps", type=int, default=None, help=argparse.SUPPRESS)          # tests only
@@ -485,7 +491,7 @@ def main(argv=None) -> int:
     settings = load_settings(over)
     use_inv = bool(settings["inversion_model"]["enabled"]) and not a.no_inversion_model
     for r in a.recording:
-        attack_recording(r, a.out, settings, use_inv)
+        attack_recording(r, a.out, settings, use_inv, a.aux_cache)
     return 0
 
 
