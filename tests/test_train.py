@@ -146,6 +146,19 @@ def test_csv_log(sim3):
     assert (sim3.logs_dir / "L1_eps0_n5_nb0_test.json").exists()
 
 
+def test_level1_norms_log_matches_server_view(sim3):
+    """logs/<run>_norms.csv: one row per (round, house), the L2 norm of that house's server_view row."""
+    with open(sim3.logs_dir / "L1_eps0_n5_nb0_norms.csv") as f:
+        rows = list(csv.DictReader(f))
+    assert list(rows[0]) == ["round", "house_id", "update_norm"]
+    assert len(rows) == N * sim3.T
+    for r, rec in _recs(sim3).items():
+        got = {row["house_id"]: float(row["update_norm"]) for row in rows if int(row["round"]) == r}
+        assert list(got) == list(rec["house_ids"])
+        want = torch.linalg.vector_norm(rec["server_view"].double(), dim=1).tolist()
+        assert list(got.values()) == pytest.approx(want, rel=1e-9)
+
+
 def test_server_view_is_exactly_local_update(sim3):
     for rec in _recs(sim3).values():
         m = common.Model()

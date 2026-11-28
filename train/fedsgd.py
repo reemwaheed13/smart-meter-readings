@@ -105,6 +105,7 @@ class FedSGD(Strategy):
         if sorted(houses) != sorted(self.s.house_ids) or len(results) != self.s.n:
             raise RuntimeError(f"round {server_round}: results do not cover the neighbourhood exactly once")
         clip_cuts = None
+        update_norms = None   # level 1 only: the server sees each raw gradient
 
         if self.s.level in (1, 2):
             # One reply per house; order the rows as house_ids.
@@ -123,6 +124,9 @@ class FedSGD(Strategy):
                 by_house[str(fr.metrics["house_id"])] = row
             server_view = torch.stack([by_house[h] for h in self.s.house_ids])  # [n, P]
             aggregate = server_view.mean(dim=0)
+            if self.s.level == 1:
+                # Per-house L2 norm of the raw gradient (house_ids order), for calibration's C.
+                update_norms = torch.linalg.vector_norm(server_view.double(), dim=1).tolist()
         else:
             # Level 3: SecAggPlusWorkflow sets every result's parameters to the same unmasked,
             # de-quantised aggregate, which is the MEAN of the n updates (equal weights).
@@ -144,6 +148,7 @@ class FedSGD(Strategy):
             "server_view": server_view,
             "dates": list(rs["dates"]),
             "clip_cuts": clip_cuts,  # level 3: values beyond the SecAgg+ clipping_range, summed over houses
+            "update_norms": update_norms,  # level 1: per-house gradient L2 norms, house_ids order
         }
         return ndarrays_to_parameters(to_ndarrays(common.unflatten(new, self.template))), {}
 

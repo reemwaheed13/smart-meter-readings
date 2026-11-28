@@ -28,16 +28,23 @@ from train.recorder import recording_path, rounds_to_record
 from train.settings import RunSettings, check_clipping_range, resolve
 
 
+def norms_path(s: RunSettings):
+    """Level 1's per-house update-norm log (logs/<run>_norms.csv); None at levels 2-3."""
+    return s.logs_dir / f"{s.run_name}_norms.csv" if s.level == 1 else None
+
+
 def run_files(s: RunSettings) -> list:
-    """Every file a complete run writes: the recordings, the CSV log and the test JSON."""
+    """Every file a complete run writes: the recordings, the CSV log, the test JSON and, at level 1,
+    the per-house update-norm log."""
+    extra = [norms_path(s)] if s.level == 1 else []
     return ([recording_path(s, r) for r in rounds_to_record(s.T)]
-            + [s.logs_dir / f"{s.run_name}.csv", s.logs_dir / f"{s.run_name}_test.json"])
+            + [s.logs_dir / f"{s.run_name}.csv", s.logs_dir / f"{s.run_name}_test.json"] + extra)
 
 
 def is_complete(s: RunSettings) -> bool:
     """True if every file of the run exists, every recording passes load_recording and matches the
-    run, the CSV has rounds 1..T, and the clipping_range logged in the test JSON equals the run's
-    (None at levels 1-2; a JSON without the key counts as None, so an older level-3 run is redone)."""
+    run, the CSV has rounds 1..T (at level 1 the norms log has n rows for each of them too), and the
+    clipping_range logged in the test JSON equals the run's (None at levels 1-2; a JSON without the key counts as None, so an older level-3 run is redone)."""
     files = run_files(s)
     if not all(p.exists() for p in files):
         return False
@@ -50,6 +57,14 @@ def is_complete(s: RunSettings) -> bool:
             rounds = [int(row["round"]) for row in csv.DictReader(f)]
         with open(s.logs_dir / f"{s.run_name}_test.json") as f:
             logged_cr = json.load(f).get("clipping_range")
+        if s.level == 1:
+            with open(norms_path(s), newline="") as f:
+                per_round: dict[int, int] = {}
+                for row in csv.DictReader(f):
+                    float(row["update_norm"])
+                    per_round[int(row["round"])] = per_round.get(int(row["round"]), 0) + 1
+            if per_round != {r: s.n for r in range(1, s.T + 1)}:
+                return False
     except (ValueError, KeyError, OSError, RuntimeError, pickle.UnpicklingError, EOFError):
         return False
     return rounds == list(range(1, s.T + 1)) and logged_cr == s.clipping_range

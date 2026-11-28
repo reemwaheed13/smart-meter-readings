@@ -52,6 +52,30 @@ calibration:
   # the quantisation step (2*clipping_range/2**22).
   clipping_range: null
 
+# How train/calibrate.py picks the calibration values above (README, "Calibration"). Every choice
+# uses val MSE on the val split, never test. train/freeze_calibration.py then writes the chosen values
+# into calibration and dp.sigma.
+calibration_procedure:
+  level: 1                       # all calibration runs are level 1 (no noise)
+  nb: 0                          # neighbourhood index of every calibration run
+  lr:
+    grid: [0.01, 0.03, 0.1, 0.3, 1.0]
+    n: 20
+    rounds: 200
+    final_rounds: 10             # final val MSE = mean over the last 10 rounds (191-200)
+    # If the pick is the lowest (highest) value tried, run the next value below (above) and pick
+    # again, at most max_extensions times in all. at_grid_edge is recorded if it is still at the edge.
+    extend_below: [0.003, 0.001]
+    extend_above: [3.0, 10.0]
+    max_extensions: 2
+  T:
+    max_rounds: 1000             # one run per n at the chosen lr; T[n] = max_rounds is kept (hit_cap)
+    window: 50                   # T[n] = first t with best-so-far val MSE improving < 1% over t..t+50
+    min_improvement: 0.01
+  # C = median per-house update L2 norm over the T runs' rounds 1..T[n] (logs/<run>_norms.csv).
+  # clipping_range = min_clipping_range(min n, T[min n], P, sigma[min eps]) + C, rounded up to 2
+  # significant figures, then checked for every (n, eps) of level 3 with its own T[n].
+
 dp:
   delta: 1.0e-5
   # Per-round Gaussian noise std for each eps. Left null until C is known, then computed with

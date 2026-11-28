@@ -56,6 +56,7 @@ class MeteredGrid:
 
 
 CSV_COLUMNS = ["round", "val_mse", "round_time_s", "bytes_per_house", "is_warmup", "clipping_range_cuts"]
+NORMS_COLUMNS = ["round", "house_id", "update_norm"]   # logs/<run>_norms.csv, level 1 only
 
 
 class ClippingRangeExceeded(RuntimeError):
@@ -75,6 +76,11 @@ class RoundRunner:
         s.logs_dir.mkdir(parents=True, exist_ok=True)
         with open(self.csv_path, "w", newline="") as f:
             csv.writer(f).writerow(CSV_COLUMNS)
+        # Level 1 only: per-house gradient L2 norms, one row per (round, house), for calibration's C.
+        self.norms_path = s.logs_dir / f"{s.run_name}_norms.csv" if s.level == 1 else None
+        if self.norms_path is not None:
+            with open(self.norms_path, "w", newline="") as f:
+                csv.writer(f).writerow(NORMS_COLUMNS)
         self.recorded: list[str] = []
 
     def __call__(self, grid, context: LegacyContext) -> None:
@@ -98,6 +104,12 @@ class RoundRunner:
             # cost is the median round_time_s over rounds 2..T (train.costs.running_cost).
             csv.writer(f).writerow([r, f"{val:.8g}", f"{round_time:.6f}", f"{bytes_per_house:g}",
                                     r == 1, "" if cuts is None else cuts])
+        if self.norms_path is not None:
+            norms = self.strategy.last_round["update_norms"]
+            with open(self.norms_path, "a", newline="") as f:
+                w = csv.writer(f)
+                for h, v in zip(self.s.house_ids, norms):
+                    w.writerow([r, h, f"{v:.10g}"])
         print(f"[{self.s.run_name}] round {r}/{self.s.T} val_mse={val:.6g} "
               f"time={round_time:.3f}s bytes/house={bytes_per_house:g}"
               + ("" if cuts is None else f" clipping_range_cuts={cuts}"), flush=True)

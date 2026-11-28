@@ -99,14 +99,15 @@ data_real.py       real London Smartmeter 2013 loader; `python data_real.py prep
 data_fake.py       random stand-in with the same interface (the tests use it)
 requirements.txt   exact pinned versions (flwr pinned: SecAgg+ APIs change between versions)
 data/              raw dataset files (gitignored, download locally)
-train/             Flower FedSGD: client, strategy, server/client apps, recorder, entry point (train.run)
+train/             Flower FedSGD: client, strategy, server/client apps, recorder, entry point (train.run),
+                   calibration (train.calibrate, train.freeze_calibration)
 attacks/           learned inverter, TS-Inverse (ts_inverse.py, reproduce_ts_inverse.py; CC BY-SA 4.0, see
                    LICENSE-THIRD-PARTY), aux_gradients.py (shared); recording.py loads and checks a recording
 eval/              blind guess, scoring, result tables and figures (see "Evaluation")
 recordings/        attack recordings (gitignored; they go to the shared Drive, never git)
 logs/              per-round CSV logs and test error (gitignored)
 tests/             pytest tests
-notebooks/         colab_run.ipynb (the Stage 4 check), attack_ts_inverse.ipynb (both attacks); outputs on Google Drive
+notebooks/         colab_run.ipynb (the Stage 4 check), calibrate.ipynb (calibration), attack_ts_inverse.ipynb (both attacks); outputs on Google Drive
 ```
 
 ## Install and test
@@ -123,8 +124,8 @@ Install the CPU build of torch first, as shown, and then the requirements. requi
 (small) Flower simulations.
 
 **The local environment is for writing code and running pytest only.** Every real run (smoke runs, timing test,
-calibration and the experiment grid) happens in Colab through `notebooks/colab_run.ipynb`, with outputs on
-Google Drive (see "Running in Colab"). Times measured on a local machine are not the project's running cost.
+calibration and the experiment grid) happens in Colab through `notebooks/colab_run.ipynb` (calibration:
+`notebooks/calibrate.ipynb`), with outputs on Google Drive (see "Running in Colab" and "Calibration"). Times measured on a local machine are not the project's running cost.
 
 ## Running
 
@@ -142,8 +143,8 @@ takes them from config.yaml and refuses the flags. If a needed value is null and
 to start. σ is `dp.sigma[eps]` if set, otherwise `common.sigma_for(eps, C, delta)`.
 
 `--out DIR` puts `recordings/` and `logs/` under DIR (default: the repo's `recordings/` and `logs/`). Runs are
-**resumable**: a run whose recordings and both log files all exist in DIR, pass `load_recording`, cover rounds
-1..T and logged the current clipping_range is skipped. A partial run, or a completed run whose test JSON logged a
+**resumable**: a run whose recordings and log files all exist in DIR (the CSV, the test JSON and, at level 1,
+`<run>_norms.csv` with n rows per round), pass `load_recording`, cover rounds 1..T and logged the current clipping_range is skipped. A partial run, or a completed run whose test JSON logged a
 different clipping_range (a JSON without the key counts as null, so an older level-3 run is redone), is deleted and
 rerun from scratch.
 
@@ -232,6 +233,48 @@ Every cell is safe to re-run. After a disconnect, just *Run all* again.
 
 Colab's torch is a different build from the pinned CPU one, so its version is recorded in every recording's
 `env`.
+
+## Calibration
+
+`notebooks/calibrate.ipynb` (Colab, real data) runs `python -m train.calibrate --out OUT` and picks lr, T[n], C,
+σ[eps] and clipping_range. The settings are in config.yaml `calibration_procedure`. **Every choice uses val MSE
+on the val split** (each run's `val_mse` column) or the level-1 update norms. The runs write their usual test JSON,
+but calibration never reads it. All runs are level 1 (no noise), neighbourhood nb = 0.
+
+1. **lr.** n = 20, 200 rounds per lr in the grid 0.01, 0.03, 0.1, 0.3, 1.0. A run's final val MSE is the mean
+   over rounds 191–200 (NaN/inf = diverged = +∞), and the lowest wins (ties go to the smaller lr). If the pick is
+   the lowest (highest) lr tried, the next value out in that direction is run (`extend_below` 0.003, 0.001;
+   `extend_above` 3.0, 10.0), with the same 200 rounds and the same rule, and the pick is redone: at most 2
+   extensions in all. Every value tried is recorded, and `at_grid_edge` if the pick is still at the edge.
+2. **T[n].** One run per n at that lr, 1000 rounds. With m[t] the best-so-far val MSE, T[n] is the first t with
+   m[t] − m[t+50] < 0.01 · m[t]. If no t qualifies, T[n] = 1000 is kept (the timing allows it), and
+   `hit_cap: true` is recorded and printed by the notebook.
+3. **C.** The median per-house update L2 norm over rounds 1..T[n] of those runs, pooled over n. The norms come
+   from `logs/<run>_norms.csv`, which every level-1 run writes (one row per round and house: the L2 norm of that
+   house's `server_view` row).
+4. **σ[eps]** = `common.sigma_for(eps, C, delta)` for eps = 1 and 8.
+5. **clipping_range** = `min_clipping_range(n = 5, T[5], P, σ[1]) + C`, rounded up to 2 significant figures. It is
+   refused unless the pre-run check passes for every level-3 (n, eps) with its own T[n].
+
+lr is tuned without noise and kept fixed across levels; a per-level lr is out of scope (limitation).
+
+Each run gets its own directory (`OUT/lr_sweep/lr<lr>/`, `OUT/T_runs/n<n>/`), and runs are resumable as above.
+`OUT/calibration.json` holds the chosen `values`, the rules as text, every val-MSE curve, `hit_cap`, the C
+quantiles, the clipping check for every (n, eps), and the accountant's total eps over T[n] rounds for every n at
+eps = 1 and 8 (the notebook's summary table prints these). `train.calibrate` refuses to start if config.yaml already
+has any calibration value or σ set.
+
+**Freezing.** The notebook previews the result in `OUT/config.frozen.yaml` but doesn't touch the repo. To
+freeze, download `calibration.json` and run locally:
+
+```bash
+python -m train.freeze_calibration --calibration calibration.json   # then commit config.yaml
+```
+
+It writes `calibration.lr`, `calibration.T[n]`, `calibration.C`, `calibration.clipping_range` and `dp.sigma[eps]`,
+editing only the `null` lines so comments and layout are kept, and reads the result back before replacing the
+file. It refuses if any of these is already set, or if calibration.json's n differ from `experiment.n`. From then
+on `train.run` takes the values from config.yaml and refuses `--lr` / `--T` / `--C` / `--clipping-range`.
 
 ## TS-Inverse
 
@@ -471,7 +514,8 @@ section when you do.
 ### config.yaml
 
 config.yaml is the single source of settings. Nothing is hard-coded elsewhere. Values that calibration
-produces (lr, T per n, C, clipping_range, sigma per eps) stay null until calibration fills them in.
+produces (lr, T per n, C, clipping_range, sigma per eps) stay null until `train.freeze_calibration` fills them
+in (see "Calibration"). How they are chosen is in `calibration_procedure`.
 
 ### Recording format
 
