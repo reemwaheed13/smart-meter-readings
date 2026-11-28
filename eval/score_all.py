@@ -14,6 +14,7 @@ INPUTS
 OUTPUTS (in --out)
     per_house.csv   one row per house per recording per attack (all scores)
     per_day.csv     one row per day: home/away labels (for balanced accuracy)
+    per_window.csv  one row per matched window (recording, attack, house, window): sMAPE attack and blind
     summary.csv     one row per (attack, level, eps, n, round): means, improvement over
                     blind guess, standard error, and whether protection holds
     summary.md      the same, as a table you can paste into the report
@@ -49,8 +50,9 @@ def load_attack_output(path):
     return out["rebuilt"] if isinstance(out, dict) else out
 
 
-def score_one(rec, rebuilt, attack, blind_mode="weekday"):
-    """Score one attack on one recording. Returns (house_rows, day_rows)."""
+def score_one(rec, rebuilt, attack, blind_mode="weekday", with_windows=False):
+    """Score one attack on one recording. Returns (house_rows, day_rows), plus window_rows (one per
+    matched true window: house, window, smape_attack, smape_blind) if with_windows."""
     level, n = int(rec["level"]), int(rec["n"])
     eps = float(rec.get("eps", 0) or 0)
     true = data.unscale(_np(rec["true_windows"]).astype(float))          # [n, 4, 96] kWh
@@ -67,13 +69,16 @@ def score_one(rec, rebuilt, attack, blind_mode="weekday"):
         matched = flat.reshape(n, n_win, -1)
 
     total_use = true.sum()
-    house_rows, day_rows = [], []
+    house_rows, day_rows, window_rows = [], [], []
     for h in range(n):
         s_att, s_bl, rise_a, rise_b, peak_a, peak_b, ok_a, ok_b = ([] for _ in range(8))
         for w in range(n_win):
             t, a, b = true[h, w], matched[h, w], blind[w]
             s_att.append(M.smape(a, t))
             s_bl.append(M.smape(b, t))
+            window_rows.append(dict(attack=attack, level=level, eps=eps, n=n, nb=int(rec["nb"]),
+                                    round=int(rec["round"]), house=rec["house_ids"][h], window=w,
+                                    smape_attack=s_att[-1], smape_blind=s_bl[-1]))
             ra, pa = M.routine_errors(a, t)
             rb, pb = M.routine_errors(b, t)
             rise_a.append(ra); rise_b.append(rb); peak_a.append(pa); peak_b.append(pb)
@@ -94,7 +99,15 @@ def score_one(rec, rebuilt, attack, blind_mode="weekday"):
             share_of_use=true[h].sum() / total_use if total_use > 0 else np.nan,
             unusual_kwh=float(np.sqrt(((true[h] - blind) ** 2).mean())),
         ))
+    if with_windows:
+        return house_rows, day_rows, window_rows
     return house_rows, day_rows
+
+
+def recording_for(attack_output, recordings_dir):
+    """attack_outputs/<stem>__<attack>.pt -> (stem, attack, recordings_dir/<stem>.pt)."""
+    stem, attack = os.path.basename(str(attack_output))[:-3].split("__")
+    return stem, attack, os.path.join(str(recordings_dir), stem + ".pt")
 
 
 # (column prefix, higher is better?)
@@ -137,34 +150,35 @@ def to_markdown(summary):
     return "\n".join(lines) + "\n"
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--recordings", default="recordings")
     ap.add_argument("--attacks", default="attack_outputs")
     ap.add_argument("--out", default="results")
     ap.add_argument("--blind", default="weekday", choices=["weekday", "same_date"])
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     outs = sorted(glob.glob(os.path.join(args.attacks, "*__*.pt")))
     if not outs:
         sys.exit(f"No attack outputs found in {args.attacks}")
-    all_h, all_d = [], []
+    all_h, all_d, all_w = [], [], []
     for path in outs:
-        stem, attack = os.path.basename(path)[:-3].split("__")
-        rec_path = os.path.join(args.recordings, stem + ".pt")
+        stem, attack, rec_path = recording_for(path, args.recordings)
         if not os.path.exists(rec_path):
             print(f"skip {path}: no recording {rec_path}")
             continue
         rec = load_recording(rec_path)
-        h, d = score_one(rec, load_attack_output(path), attack, args.blind)
+        h, d, w = score_one(rec, load_attack_output(path), attack, args.blind, with_windows=True)
         all_h += h
         all_d += d
+        all_w += [dict(recording=stem, **r) for r in w]
         print(f"scored {stem} [{attack}]")
 
     os.makedirs(args.out, exist_ok=True)
     per_house, per_day = pd.DataFrame(all_h), pd.DataFrame(all_d)
     per_house.to_csv(os.path.join(args.out, "per_house.csv"), index=False)
     per_day.to_csv(os.path.join(args.out, "per_day.csv"), index=False)
+    pd.DataFrame(all_w).to_csv(os.path.join(args.out, "per_window.csv"), index=False)
     summary = summarise(per_house, per_day)
     summary.to_csv(os.path.join(args.out, "summary.csv"), index=False)
     with open(os.path.join(args.out, "summary.md"), "w") as f:

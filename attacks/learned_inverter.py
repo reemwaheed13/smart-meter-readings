@@ -218,6 +218,31 @@ def rebuild(model: Inverter, rec: dict, mode: str) -> torch.Tensor:
     return model(rec["server_view"].float().unsqueeze(0), p)[0]
 
 
+def _aux_key(path: Path, rec: dict, settings: dict) -> dict:
+    rs = common.run_seed(rec["n"], rec["nb"])
+    return aux_gradients.cache_key(path, rec["level"], rec["C"], rec["sigma"], rec["n"], int(settings["aux_samples"]),
+                                   aux_gradients.aux_seed(rs, rec["round"]), rec["true_windows"].shape[1], rec["lr"])
+
+
+def _fingerprint(path: Path, rec: dict, settings: dict) -> dict:
+    return json.loads(json.dumps({"version": VERSION, "settings": settings, "aux": _aux_key(path, rec, settings)},
+                                 sort_keys=True))
+
+
+def completed(path: str | Path, out: str | Path, settings: dict, rec: dict | None = None) -> dict | None:
+    """The diagnostics of a finished inverter run on the recording in `out` made with these settings, else None."""
+    path = Path(path)
+    ppath, dpath = output_paths(path, out)
+    if not (dpath.exists() and ppath.exists()):
+        return None
+    rec = load_recording(path) if rec is None else rec
+    try:
+        done = json.loads(dpath.read_text())
+    except (ValueError, OSError):
+        return None
+    return done if done.get("fingerprint") == _fingerprint(path, rec, settings) else None
+
+
 def attack_recording(path: str | Path, out: str | Path, settings: dict, aux_cache: str | Path | None = None) -> dict:
     """Train the inverter on the recording's aux set and write DIR/<stem>__inverter.{pt,json}. Skips a
     recording whose outputs exist with the same settings. Returns the diagnostics."""
@@ -225,20 +250,16 @@ def attack_recording(path: str | Path, out: str | Path, settings: dict, aux_cach
     rec = load_recording(path)
     aux_cache = Path(out) / "_aux_cache" if aux_cache is None else Path(aux_cache)
     ppath, dpath = output_paths(path, out)
-    level, n, rnd, W = rec["level"], rec["n"], rec["round"], rec["true_windows"].shape[1]
+    level, n, rnd = rec["level"], rec["n"], rec["round"]
     rs = common.run_seed(n, rec["nb"])
     S, mode = int(settings["aux_samples"]), settings["blind"]
     H = n if level == 3 else 1
-    aux_key = aux_gradients.cache_key(path, level, rec["C"], rec["sigma"], n, S, aux_gradients.aux_seed(rs, rnd),
-                                      W, rec["lr"])
-    fp = json.loads(json.dumps({"version": VERSION, "settings": settings, "aux": aux_key}, sort_keys=True))
-    if dpath.exists() and ppath.exists():
-        try:
-            if json.loads(dpath.read_text()).get("fingerprint") == fp:
-                print(f"[{path.stem}] complete in {out}, skipping", flush=True)
-                return json.loads(dpath.read_text())
-        except (ValueError, OSError):
-            pass
+    aux_key = _aux_key(path, rec, settings)
+    fp = _fingerprint(path, rec, settings)
+    done = completed(path, out, settings, rec)
+    if done is not None:
+        print(f"[{path.stem}] complete in {out}, skipping", flush=True)
+        return done
 
     grads, windows, dates, aux_info = aux_gradients.cached_aux_samples(rec, path, S, aux_cache)
     print(f"[{path.stem}] aux set ({S}) {'loaded from' if aux_info['from_cache'] else 'saved to'} "

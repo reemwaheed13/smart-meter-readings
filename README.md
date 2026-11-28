@@ -329,6 +329,15 @@ configured TS-Inverse, 1 window) and `ours_level1_b4` (**our setting**: level 1,
 halves apart, as in Table II. It is not the grid's score. Its matching (`eval.metrics.match_windows`) and blind guess
 (`eval.baseline.blind_guess`, `same_date`) come from `eval/`, and MAE/RMSE are in kWh.
 
+**Level-1 gate** (must PASS before the full grid). `notebooks/gate_level1.ipynb` runs `python -m eval.gate_level1
+<step> --root MyDrive/smart-meter-fl`, one step per cell: `calibration` (stops if config.yaml is not frozen), `train`
+(the 9 level-1 runs n × k, 27 recordings), `attack` (both attacks through `attacks.pipeline`, the same code as
+`attack_ts_inverse.ipynb` cell f), `score` (`eval.score_all --blind same_date`) and `check`. Every step skips work
+already on the Drive. **(a)** PASS if the `table2_config` row's mean input and target sMAPE are each at most
+`gate.repro_factor` (10) × Table II. **(b)** PASS if the mean paired difference sMAPE(blind) − sMAPE(inverter) over
+every (recording, matched house-window) of the 27 recordings (`per_window.csv`) exceeds 2 standard errors. The verdict
+goes to `MyDrive/smart-meter-fl/gate_level1/gate_level1.json`.
+
 ### TS-Inverse: what is ported and what changed
 
 Ported (`attacks/ts_inverse.py`): their attack loop (`AttackTSInverseWorker.attack_batch`): L1 gradient loss, Adam at

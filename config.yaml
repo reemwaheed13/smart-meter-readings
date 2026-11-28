@@ -172,3 +172,11 @@ attacks:
     seeds: [10, 43, 28, 80, 71]    # their Table II seeds
     # Table II, London Smartmeter, FCN, batch 1, TS-Inverse: sMAPE (mean over the 5 seeds).
     paper_fcn_london_b1: {input_smape: 6.3e-06, target_smape: 2.5e-06}
+
+# Level-1 gate (eval/gate_level1.py, notebooks/gate_level1.ipynb): must PASS before the full grid.
+gate:
+  # (a) Reproduction: the table2_config row of attacks/reproduce/reproduction.json passes if its mean input AND
+  # target sMAPE (paper scale, 0-1) are each at most repro_factor x Table II (attacks.reproduce.paper_fcn_london_b1).
+  # (b) Inverter vs blind (no setting): mean paired (blind - inverter) sMAPE over every (recording, matched
+  # house-window) of the 27 level-1 recordings must exceed 2 standard errors.
+  repro_factor: 10

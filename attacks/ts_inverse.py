@@ -352,6 +352,19 @@ def output_paths(recording: str | Path, out: str | Path) -> tuple[Path, Path, Pa
     return out / f"{stem}__{ATTACK}.pt", out / f"{stem}__{ATTACK}.json", out / "_work" / stem
 
 
+def completed(recording: str | Path, out: str | Path, settings: dict, use_inversion: bool = True) -> dict | None:
+    """The diagnostics of a finished attack on `recording` in `out` made with these settings, else None."""
+    ppath, dpath, _ = output_paths(recording, out)
+    if not (dpath.exists() and ppath.exists()):
+        return None
+    fp = json.loads(json.dumps(fingerprint(settings, use_inversion), sort_keys=True))
+    try:
+        done = json.loads(dpath.read_text())
+    except (ValueError, OSError):
+        return None
+    return done if done.get("fingerprint") == fp else None
+
+
 def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inversion: bool = True,
                      aux_cache: str | Path | None = None) -> dict:
     """Attack one recording; write DIR/<stem>__tsinverse.pt ({"rebuilt"}) and DIR/<stem>__tsinverse.json
@@ -365,14 +378,10 @@ def attack_recording(path: str | Path, out: str | Path, settings: dict, use_inve
     d.mkdir(parents=True, exist_ok=True)
     fp = fingerprint(settings, use_inversion)
     fp_json = json.dumps(fp, sort_keys=True)
-    if dpath.exists() and ppath.exists():
-        try:
-            done = json.loads(dpath.read_text())
-            if done.get("fingerprint") == json.loads(fp_json):
-                print(f"[{path.stem}] complete in {out}, skipping", flush=True)
-                return done
-        except (ValueError, OSError):
-            pass
+    done = completed(path, out, settings, use_inversion)
+    if done is not None:
+        print(f"[{path.stem}] complete in {out}, skipping", flush=True)
+        return done
 
     level, n, rnd, C, lr = rec["level"], rec["n"], rec["round"], rec["C"], rec["lr"]
     W = rec["true_windows"].shape[1]
